@@ -1,7 +1,7 @@
 [project]
 name = "crm-ml-hybrid"
-version = "0.1.0"
-description = "CRM-ML hybrid production forecasting (after Ogali & Orodu, 2025) with paper-style charts and a Streamlit GUI"
+version = "0.2.0"
+description = "CRM-ML hybrid production forecasting (after Ogali & Orodu, 2025) - single-file program main.py"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
@@ -11,15 +11,9 @@ dependencies = [
     "scikit-learn>=1.3",
     "matplotlib>=3.7",
     "openpyxl>=3.1",
-    "streamlit>=1.65.0",
+    "xgboost>=2.0",
+    "streamlit>=1.30",
 ]
-
-[project.optional-dependencies]
-gui = ["streamlit>=1.30"]
-xgb = ["xgboost>=2.0"]
-
-[dependency-groups]
-dev = ["pytest", "ruff"]
 
 [tool.uv]
 package = false   # scripts-only project: no build backend needed
