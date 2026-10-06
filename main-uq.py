@@ -27,13 +27,13 @@ option, while CRM-NuSVM, CRM-ELM and CRM-MLP remain selectable alternatives.
 Reference model
 ---------------
 Ogali, O.I.O. and Orodu, O.D. (2025). "Concatenating data-driven and reduced-
-physics models for smart production forecasting." Earth Science Informatics,
-18:246. DOI: 10.1007/s12145-025-01745-9.
+physics models for smart production forecasting." DOI: 10.1007/s12145-025-01745-9.
 
 UQ methodology
 --------------
 1. Calibrate the CRM from injection and production history.
-2. Build the paper's CRM-ML feature vector for the selected hybrid.
+2. Build the paper's CRM-ML feature vector and add the time-varying CRM response
+   as a Bayesian-extension physics feature.
 3. Fit the selected ML model to positive production rates on the historical data.
 4. Use a chronological hold-out block to obtain out-of-sample calibration errors.
 5. Model positive production with a Lognormal likelihood:
@@ -142,9 +142,9 @@ UQ_MAX_CRM_PREDICTIVE_DRAWS = 500
 UQ_WEAK_PRIOR_SD = 5.0
 
 
-# ===========================================================================
+
 # 1. DATA STRUCTURES AND METRICS
-# ===========================================================================
+
 
 
 @dataclass
@@ -208,9 +208,9 @@ def r_squared(q_obs: np.ndarray, q_est: np.ndarray) -> float:
     return float(1.0 - sse / sst)
 
 
-# ===========================================================================
+
 # 2. EXCEL IMPORT / VALIDATION
-# ===========================================================================
+
 
 
 SHEET_ALIASES: Dict[str, List[str]] = {
@@ -423,9 +423,9 @@ def write_template(path: Union[str, Path], n_steps: int = 36, n_injectors: int =
     return path
 
 
-# ===========================================================================
+
 # 3. CRM
-# ===========================================================================
+
 
 
 @dataclass
@@ -556,9 +556,9 @@ class CapacitanceResistanceModel:
         return scaled * self._scale
 
 
-# ===========================================================================
+
 # 4. SELECTED CRM-ML MODEL
-# ===========================================================================
+
 
 
 class ExtremeLearningMachine(BaseEstimator, RegressorMixin):
@@ -607,12 +607,40 @@ def make_ml_regressor(model_name: str, seed: int = 0):
 
 
 def build_crm_ml_features(time: np.ndarray, injection: np.ndarray, params: CRMParameters,
-                          distances: np.ndarray, producer: int) -> np.ndarray:
-    """Paper CRM-ML vector: [time, distances, lambda, tau_ij, injections, tau_j]."""
-    t = np.asarray(time, float)
+                          distances: np.ndarray, producer: int,
+                          crm_response: np.ndarray) -> np.ndarray:
+    """Build CRM-ML features with a dynamic CRM response feature.
+
+    The published CRM-ML feature vector contains time, distances, calibrated
+    CRM parameters, injection rates and producer response time. In a
+    producer-specific model, lambda/tau values are constant across all rows.
+    That makes them zero-variance features and prevents posterior CRM draws
+    from affecting the fitted ML model.
+
+    The Bayesian extension therefore adds the time-varying CRM response for
+    this producer. The raw paper features are retained; the CRM response is an
+    additional physics feature whose value changes when lambda/tau are drawn
+    from the Bayesian posterior.
+    """
+    t = np.asarray(time, float).ravel()
     inj = np.asarray(injection, float)
-    const = np.concatenate([distances[:, producer], params.lambda_ij[:, producer], params.tau_ij[:, producer]])
-    return np.column_stack([t, np.tile(const, (len(t), 1)), inj, np.full(len(t), params.tau_j[producer])])
+    response = np.asarray(crm_response, float).ravel()
+    if inj.ndim != 2 or inj.shape[0] != len(t):
+        raise ValueError("Injection and time dimensions are inconsistent in CRM-ML features.")
+    if response.size != len(t):
+        raise ValueError("CRM response and time dimensions are inconsistent in CRM-ML features.")
+    const = np.concatenate([
+        distances[:, producer],
+        params.lambda_ij[:, producer],
+        params.tau_ij[:, producer],
+    ])
+    return np.column_stack([
+        t,
+        np.tile(const, (len(t), 1)),
+        inj,
+        np.full(len(t), params.tau_j[producer]),
+        response,
+    ])
 
 
 def fit_positive_crm_ml(model_name: str, X: np.ndarray, y: np.ndarray, seed: int):
@@ -635,9 +663,9 @@ def positive_prediction(model, X: np.ndarray) -> np.ndarray:
     return q
 
 
-# ===========================================================================
+
 # 5. DEEP BAYESIAN CRM + CRM-ML POSTERIOR PREDICTIVE UQ
-# ===========================================================================
+
 
 
 @dataclass
@@ -984,11 +1012,11 @@ def _theta_names(n_inj: int, n_prod: int, producer_names: Sequence[str],
 
 def _fit_final_ml_models(model_name: str, time_rows: np.ndarray, inj_rows: np.ndarray,
                          prod_rows: np.ndarray, distances: np.ndarray, params: CRMParameters,
-                         active_starts: np.ndarray, seed: int):
+                         crm_response_rows: np.ndarray, active_starts: np.ndarray, seed: int):
     models = []
     for j in range(prod_rows.shape[1]):
         s = int(active_starts[j])
-        X = build_crm_ml_features(time_rows, inj_rows, params, distances, j)
+        X = build_crm_ml_features(time_rows, inj_rows, params, distances, j, crm_response_rows[:, j])
         y = prod_rows[:, j]
         mask = _positive_active_mask(y, s)
         if int(mask.sum()) < 8:
@@ -997,15 +1025,25 @@ def _fit_final_ml_models(model_name: str, time_rows: np.ndarray, inj_rows: np.nd
     return models
 
 
-def _predict_posterior_ml(models, time_rows: np.ndarray, injection_rows: np.ndarray,
-                          distances: np.ndarray, crm_draws: Sequence[CRMParameters]) -> np.ndarray:
+def _predict_posterior_ml(models, forecast_time: np.ndarray, forecast_injection: np.ndarray,
+                          distances: np.ndarray, crm_draws: Sequence[CRMParameters],
+                          full_time: np.ndarray, full_injection: np.ndarray, q0: np.ndarray,
+                          forecast_start: int) -> np.ndarray:
     n_draws = len(crm_draws)
-    n_steps = len(time_rows)
+    n_steps = len(forecast_time)
     n_prod = distances.shape[1]
     out = np.empty((n_draws, n_steps, n_prod), dtype=float)
     for d, params in enumerate(crm_draws):
+        # Simulate the full history + forecast so the CRM state at the forecast
+        # boundary is conditioned on the observed history. crm_simulate returns
+        # rows corresponding to full_time[1:], hence forecast_start - 1.
+        response_all = crm_simulate(params, full_time, full_injection, q0)
+        response_forecast = response_all[forecast_start - 1:]
         for j in range(n_prod):
-            X = build_crm_ml_features(time_rows, injection_rows, params, distances, j)
+            X = build_crm_ml_features(
+                forecast_time, forecast_injection, params, distances, j,
+                response_forecast[:, j]
+            )
             out[d, :, j] = positive_prediction(models[j], X)
     return out
 
@@ -1013,7 +1051,7 @@ def _predict_posterior_ml(models, time_rows: np.ndarray, injection_rows: np.ndar
 def _fit_oos_ml_calibration(models_name: str, time_rows: np.ndarray,
                              injection_rows: np.ndarray, production_rows: np.ndarray,
                              distances: np.ndarray, crm_params: CRMParameters,
-                             active_starts: np.ndarray, seed: int,
+                             crm_response_rows: np.ndarray, active_starts: np.ndarray, seed: int,
                              producer_names: Sequence[str],
                              fraction: float = UQ_CALIBRATION_FRACTION
                              ) -> Tuple[pd.DataFrame, np.ndarray]:
@@ -1023,7 +1061,7 @@ def _fit_oos_ml_calibration(models_name: str, time_rows: np.ndarray,
     for j, pname in enumerate(producer_names):
         s = int(active_starts[j])
         y = production_rows[:, j]
-        X = build_crm_ml_features(time_rows, injection_rows, crm_params, distances, j)
+        X = build_crm_ml_features(time_rows, injection_rows, crm_params, distances, j, crm_response_rows[:, j])
         mask = _positive_active_mask(y, s)
         active_idx = np.flatnonzero(mask)
         active_n = len(active_idx)
@@ -1284,20 +1322,50 @@ def run_bayesian_uq(data: FieldData, n_forecast: int, model: str = DEFAULT_CRM_M
     time_rows, inj_rows, prod_rows = data.time[1:n_hist], data.injection[1:n_hist], data.production[1:n_hist]
     starts_rows = np.maximum(starts_full - 1, 0)
 
-    # Conditional ML fit uses posterior-mean CRM parameters.
+    # Build the dynamic CRM response for each parameter set. This is the key
+    # Bayesian-extension feature: unlike the raw lambda/tau columns, q_CRM(t)
+    # varies with time and changes when a posterior CRM draw changes.
+    q0 = np.asarray(data.production[0], float)
+    crm_hist_mean = crm_simulate(
+        posterior_mean_params, data.time[:n_hist], data.injection[:n_hist], q0
+    )
+    crm_hist_det = crm_simulate(
+        crm.params_, data.time[:n_hist], data.injection[:n_hist], q0
+    )
+    crm_response_rows_mean = crm_hist_mean
+    crm_response_rows_det = crm_hist_det
+
+    # Conditional ML fit uses posterior-mean CRM parameters, but now receives
+    # the corresponding dynamic CRM response as a feature.
     bayes_models = _fit_final_ml_models(model_name, time_rows, inj_rows, prod_rows,
-                                        data.distances, posterior_mean_params, starts_rows, seed)
+                                        data.distances, posterior_mean_params,
+                                        crm_response_rows_mean, starts_rows, seed)
     baseline_models = _fit_final_ml_models(model_name, time_rows, inj_rows, prod_rows,
-                                           data.distances, crm.params_, starts_rows, seed + 500_000)
+                                           data.distances, crm.params_,
+                                           crm_response_rows_det, starts_rows, seed + 500_000)
 
     forecast_time = data.time[n_hist:]
     forecast_inj = data.injection[n_hist:]
     observed_forecast = data.production[n_hist:]
+    crm_full_mean = crm_simulate(
+        posterior_mean_params, data.time, data.injection, q0
+    )
+    crm_full_det = crm_simulate(
+        crm.params_, data.time, data.injection, q0
+    )
+    crm_forecast_mean = crm_full_mean[n_hist - 1:]
+    crm_forecast_det = crm_full_det[n_hist - 1:]
     baseline_pred = np.empty((n_forecast, n_prod))
     mean_pred = np.empty_like(baseline_pred)
     for j in range(n_prod):
-        Xb = build_crm_ml_features(forecast_time, forecast_inj, crm.params_, data.distances, j)
-        Xm = build_crm_ml_features(forecast_time, forecast_inj, posterior_mean_params, data.distances, j)
+        Xb = build_crm_ml_features(
+            forecast_time, forecast_inj, crm.params_, data.distances, j,
+            crm_forecast_det[:, j]
+        )
+        Xm = build_crm_ml_features(
+            forecast_time, forecast_inj, posterior_mean_params, data.distances, j,
+            crm_forecast_mean[:, j]
+        )
         baseline_pred[:, j] = positive_prediction(baseline_models[j], Xb)
         mean_pred[:, j] = positive_prediction(bayes_models[j], Xm)
 
@@ -1310,7 +1378,7 @@ def run_bayesian_uq(data: FieldData, n_forecast: int, model: str = DEFAULT_CRM_M
     # The CRM-only residual sigma from the HMC block is deliberately NOT reused.
     calibration_predictions, ml_sigma = _fit_oos_ml_calibration(
         model_name, time_rows, inj_rows, prod_rows, data.distances,
-        posterior_mean_params, starts_rows, seed + 700_000,
+        posterior_mean_params, crm_response_rows_mean, starts_rows, seed + 700_000,
         producer_names=data.producer_names,
         fraction=UQ_CALIBRATION_FRACTION,
     )
@@ -1323,7 +1391,8 @@ def run_bayesian_uq(data: FieldData, n_forecast: int, model: str = DEFAULT_CRM_M
     n_theta = flat.shape[1] - n_prod
     crm_draws = [_crm_params_from_theta(row[:n_theta], data.injection.shape[1], n_prod) for row in flat]
     ml_draws = _predict_posterior_ml(
-        bayes_models, forecast_time, forecast_inj, data.distances, crm_draws
+        bayes_models, forecast_time, forecast_inj, data.distances, crm_draws,
+        data.time, data.injection, q0, n_hist
     )
 
     # Use the selected CRM-ML model's historical out-of-sample residual scale.
@@ -1405,9 +1474,9 @@ def run_bayesian_uq(data: FieldData, n_forecast: int, model: str = DEFAULT_CRM_M
     return result
 
 
-# ===========================================================================
+
 # 6. FIGURES AND EXPORTS
-# ===========================================================================
+
 
 
 def plot_production_history(data: FieldData, n_hist: Optional[int] = None) -> plt.Figure:
@@ -1559,6 +1628,7 @@ def plot_mcmc_diagnostics(result: BayesianUQResult) -> plt.Figure:
         indices = [0, n_prod, max(0, p-1)]
         labels = ["tau_j (first producer)", "lambda (first pair)", "sigma (last parameter)"]
         transforms = [np.exp, lambda x: 1.0/(1.0+np.exp(-x)), lambda x: np.exp(x)]
+        title = f"Bayesian CRM HMC trace diagnostics - {result.model}"
     fig, axes = plt.subplots(3, 1, figsize=(10, 7), sharex=True)
     for ax, idx, label, transform in zip(axes, indices, labels, transforms):
         for c in range(chain.shape[0]):
@@ -1629,9 +1699,7 @@ def _print_report(result: BayesianUQResult) -> None:
     print(result.rhat.round(4).to_string(index=False))
 
 
-# ===========================================================================
 # 7. CLI / STREAMLIT GUI
-# ===========================================================================
 
 
 def main(argv: Optional[Sequence[str]] = None) -> None:
@@ -1730,7 +1798,7 @@ def run_gui() -> None:
         trim = st.checkbox("Exclude leading inactive producer rows", value=False)
 
         st.header("3. Bayesian UQ / HMC")
-        chains = st.slider("MCMC chains", 2, 6, MCMC_DEFAULT_CHAINS)
+        chains = st.slider("MCMC chains", 2, 20, MCMC_DEFAULT_CHAINS)
         samples = st.number_input(
             "Retained samples per chain", 100, 10000, MCMC_DEFAULT_SAMPLES, 100
         )
