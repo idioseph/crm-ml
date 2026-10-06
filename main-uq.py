@@ -799,7 +799,7 @@ def _make_crm_posterior(time: np.ndarray, injection: np.ndarray, production: np.
     ~ N(0, UQ_LAMBDA_LOGIT_SD^2).
     """
     dtype = torch.float64
-    t = torch.as_tensor(time, dtype=dtype)
+    t = torch.as_tensor(np.array(time, copy=True), dtype=dtype)
     w = torch.as_tensor(injection / production_scale, dtype=dtype)
     q0 = torch.as_tensor(production[0] / production_scale, dtype=dtype)
     y = torch.as_tensor(production[1:], dtype=dtype)
