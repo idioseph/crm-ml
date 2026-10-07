@@ -728,35 +728,51 @@ def _hmc_sample(logpost: Callable[[torch.Tensor], torch.Tensor], theta0: np.ndar
                 step_size: float = 0.05, leapfrog_steps: int = 5,
                 extra_fn: Optional[Callable[[torch.Tensor, np.random.Generator], np.ndarray]] = None,
                 n_extra: int = 0) -> Tuple[np.ndarray, float, float]:
-    """Generic HMC (identity mass matrix) with step-size adaptation during burn-in.
-
-    Returns (draws [n_samples, d + n_extra], post-burn-in acceptance rate, final step size).
-    """
     if n_samples < 100 or burn_in < 100 or thin < 1:
         raise ValueError("Use at least 100 retained samples, 100 burn-in iterations and thin >= 1.")
     if leapfrog_steps < 1 or step_size <= 0:
         raise ValueError("HMC step size must be positive and leapfrog steps must be >= 1.")
+
     torch.manual_seed(int(seed))
     rng = np.random.default_rng(int(seed))
     dtype = torch.float64
     theta = torch.as_tensor(np.asarray(theta0, float), dtype=dtype).detach().clone()
-    if not torch.isfinite(logpost(theta)):
+    lp0 = logpost(theta)
+    if not torch.isfinite(lp0):
         raise RuntimeError("Initial state has an invalid posterior density.")
+
     d = theta.numel()
     total = burn_in + n_samples * thin
     draws = np.empty((n_samples, d + n_extra))
+
+    # Momentum covariance (diagonal mass matrix). Start with identity and
+    # learn a scale from the warm-up trajectory.
+    mass = torch.ones(d, dtype=dtype)
+    inv_mass = torch.ones(d, dtype=dtype)
+
     eps = float(step_size)
     saved, acc_post = 0, 0
     recent: List[float] = []
+
+    # Welford running variance for the position during warm-up.
+    mean = torch.zeros(d, dtype=dtype)
+    m2 = torch.zeros(d, dtype=dtype)
+    n_adapt = 0
+
     for it in range(total):
         q = theta.detach().clone().requires_grad_(True)
-        p0 = torch.randn_like(q)
+        p0 = torch.randn_like(q) * torch.sqrt(mass)
         lp = logpost(q)
         grad = torch.autograd.grad(lp, q)[0]
+
+        # Hamiltonian dynamics for diagonal mass M:
+        # dq/dt = M^{-1} p, dp/dt = grad(log posterior).
         p = p0 + 0.5 * eps * grad
         q_new, valid = q, True
+        grad_new = grad
+
         for lf in range(leapfrog_steps):
-            q_new = (q_new + eps * p).detach().requires_grad_(True)
+            q_new = (q_new + eps * inv_mass * p).detach().requires_grad_(True)
             lp_new = logpost(q_new)
             if not torch.isfinite(lp_new):
                 valid = False
@@ -764,18 +780,47 @@ def _hmc_sample(logpost: Callable[[torch.Tensor], torch.Tensor], theta0: np.ndar
             grad_new = torch.autograd.grad(lp_new, q_new)[0]
             if lf < leapfrog_steps - 1:
                 p = p + eps * grad_new
+
         accepted = False
         if valid:
             p = -(p + 0.5 * eps * grad_new)
-            cur_h = -lp.detach() + 0.5 * torch.sum(p0 ** 2)
-            prop_h = -lp_new.detach() + 0.5 * torch.sum(p ** 2)
-            log_acc = min(0.0, float(cur_h - prop_h))
+            cur_h = -lp.detach() + 0.5 * torch.sum((p0 ** 2) * inv_mass)
+            prop_h = -lp_new.detach() + 0.5 * torch.sum((p ** 2) * inv_mass)
+            delta = float(cur_h - prop_h)
+            log_acc = min(0.0, delta) if np.isfinite(delta) else -np.inf
             if math.log(max(rng.random(), 1e-300)) < log_acc:
-                theta, accepted = q_new.detach(), True
+                theta = q_new.detach()
+                accepted = True
+
         recent.append(1.0 if accepted else 0.0)
-        if it < burn_in and (it + 1) % 50 == 0:
-            rate = float(np.mean(recent[-50:]))
-            eps = float(np.clip(eps * math.exp(2.0 * (rate - MCMC_TARGET_ACCEPTANCE)), 0.002, 0.5))
+
+        # Warm-up only: learn posterior scale from the accepted/current state.
+        if it < burn_in:
+            x = theta.detach()
+            n_adapt += 1
+            delta_x = x - mean
+            mean += delta_x / n_adapt
+            m2 += delta_x * (x - mean)
+
+            # Adapt every 100 warm-up iterations after enough states exist.
+            if (it + 1) % 100 == 0 and n_adapt >= 100:
+                var = m2 / max(n_adapt - 1, 1)
+                var = torch.clamp(var, min=1e-4, max=1e4)
+                # For HMC, a useful diagonal mass is approximately the inverse
+                # posterior variance.  Cap it to avoid extreme momentum scales.
+                new_mass = torch.clamp(1.0 / var, min=1e-3, max=1e3)
+                # Dampen adaptation to avoid abrupt geometry changes.
+                mass = torch.sqrt(mass * new_mass)
+                inv_mass = 1.0 / mass
+
+                rate = float(np.mean(recent[-100:]))
+                # Conservative adaptation; the old exp(2*(rate-target)) was
+                # unnecessarily aggressive for this high-dimensional posterior.
+                eps = float(np.clip(
+                    eps * math.exp(0.5 * (rate - MCMC_TARGET_ACCEPTANCE)),
+                    0.001, 0.25
+                ))
+
         if it >= burn_in:
             acc_post += int(accepted)
             if (it - burn_in) % thin == 0:
@@ -783,6 +828,9 @@ def _hmc_sample(logpost: Callable[[torch.Tensor], torch.Tensor], theta0: np.ndar
                 if extra_fn is not None:
                     draws[saved, d:] = extra_fn(theta, rng)
                 saved += 1
+
+    if saved != n_samples:
+        raise RuntimeError(f"HMC saved {saved} draws but expected {n_samples}.")
     return draws, acc_post / max(n_samples * thin, 1), eps
 
 
@@ -1537,7 +1585,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     parser.add_argument("--mcmc-burnin", type=int, default=MCMC_DEFAULT_BURN_IN)
     parser.add_argument("--mcmc-thin", type=int, default=MCMC_DEFAULT_THIN)
     parser.add_argument("--hmc-step-size", type=float, default=0.05)
-    parser.add_argument("--hmc-leapfrog-steps", type=int, default=5)
+    parser.add_argument("--hmc-leapfrog-steps", type=int, default=8)
     parser.add_argument("--predictive-draws", type=int, default=UQ_MAX_CRM_PREDICTIVE_DRAWS,
                         help="Posterior CRM draws propagated through CRM-ML (default 200)")
     parser.add_argument("--no-refit", action="store_true",
