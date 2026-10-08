@@ -13,12 +13,12 @@
 #     "streamlit>=1.30",
 # ]
 # ///
-
 from __future__ import annotations
 
 import argparse
 import io
 import math
+import re
 import sys
 import tempfile
 import warnings
@@ -72,7 +72,7 @@ ML_SETTINGS = {
 MCMC_DEFAULT_CHAINS = 3
 MCMC_DEFAULT_SAMPLES = 1500
 MCMC_DEFAULT_BURN_IN = 1000
-MCMC_DEFAULT_THIN = 2
+MCMC_DEFAULT_THIN = 1
 MCMC_DEFAULT_SEED = 2025
 MCMC_TARGET_ACCEPTANCE = 0.65
 UQ_CI_LEVEL = 0.95
@@ -84,7 +84,9 @@ UQ_TAU_LOG_SD = 2.0          # prior sd of log(tau) around a data-scale referenc
 UQ_LAMBDA_LOGIT_SD = 1.5     # prior sd of the softmax-with-slack logits
 
 
+
 # 1. DATA STRUCTURES AND METRICS
+
 
 @dataclass
 class FieldData:
@@ -119,7 +121,6 @@ class FieldData:
                 f"peak_rate [{self.rate_unit}]": float(self.production[:, j].max()),
             })
         return pd.DataFrame(rows)
-
 
 def _truncate_field(data: FieldData, n: int) -> FieldData:
     return FieldData(
@@ -157,7 +158,9 @@ def r_squared(q_obs: np.ndarray, q_est: np.ndarray) -> float:
     return float(1.0 - float(np.sum((q_obs - q_est) ** 2)) / sst)
 
 
+
 # 2. EXCEL IMPORT / VALIDATION
+
 
 SHEET_ALIASES: Dict[str, List[str]] = {
     "time": ["time", "t", "date", "days", "months"],
@@ -328,7 +331,9 @@ def write_template(path: Union[str, Path], n_steps: int = 36, n_injectors: int =
     return path
 
 
+
 # 3. CRM
+
 
 @dataclass
 class CRMParameters:
@@ -389,7 +394,8 @@ class CapacitanceResistanceModel:
         tau_ij = np.exp(x[p:p+n_inj*n_prod].reshape(n_inj, n_prod))
         return CRMParameters(tau_j, lam, tau_ij)
 
-    def fit(self, time: np.ndarray, injection: np.ndarray, production: np.ndarray) -> "CapacitanceResistanceModel":
+    def fit(self, time: np.ndarray, injection: np.ndarray, production: np.ndarray,
+            fit_mask: Optional[np.ndarray] = None) -> "CapacitanceResistanceModel":
         time, injection, production = map(lambda x: np.asarray(x, float), (time, injection, production))
         n, n_inj = injection.shape
         if time.size != n or production.shape[0] != n:
@@ -417,10 +423,16 @@ class CapacitanceResistanceModel:
         if n_inj > 0:  # an empty constraint set breaks SLSQP when there are no injectors
             opt_kwargs["constraints"] = {"type": "ineq", "fun": lambda x: 1.0 - A @ x, "jac": lambda x: -A}
         q0 = q[0]
+        # rows excluded from the fit (e.g. shut-ins); default is to use every row
+        use = np.ones(production.shape, dtype=bool) if fit_mask is None else np.asarray(fit_mask, bool)
+        if use.shape != production.shape:
+            raise ValueError('fit_mask must have the same shape as production.')
+        use1 = use[1:]
+        n_use = max(int(use1.sum()), 1)
 
         def objective(x: np.ndarray) -> float:
             pred = crm_simulate(self._unpack(x, n_inj, n_prod), time, w, q0)
-            return float(np.mean((q[1:] - pred) ** 2))
+            return float(np.sum(((q[1:] - pred) ** 2) * use1) / n_use)
 
         rng = np.random.default_rng(self.random_state)
         best_x, best_f = None, np.inf
@@ -458,7 +470,9 @@ class CapacitanceResistanceModel:
         return scaled * self._scale
 
 
+
 # 4. SELECTED CRM-ML MODEL
+
 
 class ExtremeLearningMachine(BaseEstimator, RegressorMixin):
     """Small single-hidden-layer ELM."""
@@ -542,7 +556,9 @@ def positive_prediction(model, X: np.ndarray) -> np.ndarray:
     return q
 
 
+
 # 5. BAYESIAN CRM + CRM-ML POSTERIOR PREDICTIVE UQ
+
 
 @dataclass
 class BayesianUQResult:
@@ -566,6 +582,7 @@ class BayesianUQResult:
     historical_production: pd.DataFrame
     ml_bias: Optional[np.ndarray] = None
     settings: Dict[str, object] = field(default_factory=dict)
+    functional_diagnostics: Optional[pd.DataFrame] = None
 
 
 def _positive_active_mask(y: np.ndarray) -> np.ndarray:
@@ -684,12 +701,20 @@ def _lag1_autocorr(r: np.ndarray) -> float:
 
 def _crm_simulate_torch(theta: torch.Tensor, time: torch.Tensor, injection_scaled: torch.Tensor,
                         q0_scaled: torch.Tensor, n_inj: int, n_prod: int) -> torch.Tensor:
-    """Differentiable CRM. The injection response is computed in log space:
-    response_n = sum_{k<=n} (1-a_k) s_k exp(L_n - L_k), L = -cumsum(dt/tau),
-    which never overflows/underflows (all exponents are <= 0)."""
+    """Differentiable CRM.
+
+    response_n = sum_{k<=n} src_k * exp(L_n - L_k),  L = -cumsum(dt/tau),  src = (1-a)*s
+               = exp( L_n + logcumsumexp(log src_k - L_k) )
+    All of it stays in log space, so there is no cumprod underflow and no N x N tensor.
+    Cost is O(N*I*K) per call (the N x N version was O(N^2*I*K)).
+    """
     p = 0
     tau_j = torch.exp(theta[p:p+n_prod]); p += n_prod
-    z = theta[p:p+n_inj*n_prod].reshape(n_inj, n_prod); p += n_inj*n_prod
+    """ 
+    lambda_ij = exp(theta[p:p+n_inj*n_prod]).reshape(n_inj, n_prod); p += n_inj*n_prod
+    """
+    z = theta[p:p+n_inj*n_prod].reshape(n_inj, n_prod); 
+    p += n_inj*n_prod
     tau_ij = torch.exp(theta[p:p+n_inj*n_prod]).reshape(n_inj, n_prod)
     dt = torch.diff(time)
     t_rel = time[1:] - time[0]
@@ -702,20 +727,17 @@ def _crm_simulate_torch(theta: torch.Tensor, time: torch.Tensor, injection_scale
     x = dt[:, None, None] / tau_ij[None, :, :]
     a = torch.exp(-x)
     src = (1.0 - a) * signal[:, :, None]
-    N = dt.shape[0]
-    if N * N * n_inj * n_prod <= 3e7:
-        L = -torch.cumsum(x, dim=0)
-        diff = L[:, None] - L[None, :]
-        upper = torch.triu(torch.ones(N, N, dtype=torch.bool), diagonal=1)
-        diff = diff.masked_fill(upper[:, :, None, None], float("-inf"))
-        response = torch.einsum("nkip,kip->nip", torch.exp(diff), src)
-    else:  # memory-safe fallback for very long histories
+    if bool(torch.any(signal < 0)):
+        # log-space needs src >= 0; plain recurrence if negative injection was supplied
         prev = torch.zeros((n_inj, n_prod), dtype=theta.dtype)
         outs = []
-        for n in range(N):
+        for n in range(dt.shape[0]):
             prev = a[n] * prev + src[n]
             outs.append(prev)
         response = torch.stack(outs)
+    else:
+        L = -torch.cumsum(x, dim=0)
+        response = torch.exp(L + torch.logcumsumexp(torch.log(src + 1e-300) - L, dim=0))
     return out + torch.sum(response * weights.unsqueeze(0), dim=1)
 
 
@@ -728,6 +750,18 @@ def _hmc_sample(logpost: Callable[[torch.Tensor], torch.Tensor], theta0: np.ndar
                 step_size: float = 0.05, leapfrog_steps: int = 5,
                 extra_fn: Optional[Callable[[torch.Tensor, np.random.Generator], np.ndarray]] = None,
                 n_extra: int = 0) -> Tuple[np.ndarray, float, float]:
+    """HMC with a diagonal mass matrix.
+
+    Differences from the previous version:
+    - the posterior variance is estimated in windows (15% initial step-size-only phase,
+      doubling windows, 10% final phase) and the running estimate is RESET after each
+      window, so the early transient from the starting point no longer inflates it;
+    - the variance is shrunk toward a small constant (Stan's regularisation);
+    - the number of leapfrog steps is drawn uniformly from [L/2, 3L/2] each iteration,
+      which avoids periodic trajectories;
+    - the step size is adapted every 25 iterations toward MCMC_TARGET_ACCEPTANCE.
+    Returns (draws, post-burn-in acceptance rate, final step size).
+    """
     if n_samples < 100 or burn_in < 100 or thin < 1:
         raise ValueError("Use at least 100 retained samples, 100 burn-in iterations and thin >= 1.")
     if leapfrog_steps < 1 or step_size <= 0:
@@ -737,48 +771,55 @@ def _hmc_sample(logpost: Callable[[torch.Tensor], torch.Tensor], theta0: np.ndar
     rng = np.random.default_rng(int(seed))
     dtype = torch.float64
     theta = torch.as_tensor(np.asarray(theta0, float), dtype=dtype).detach().clone()
-    lp0 = logpost(theta)
-    if not torch.isfinite(lp0):
+    if not torch.isfinite(logpost(theta)):
         raise RuntimeError("Initial state has an invalid posterior density.")
 
     d = theta.numel()
     total = burn_in + n_samples * thin
     draws = np.empty((n_samples, d + n_extra))
 
-    # Momentum covariance (diagonal mass matrix). Start with identity and
-    # learn a scale from the warm-up trajectory.
+    inv_mass = torch.ones(d, dtype=dtype)   # diagonal of M^-1, tracks posterior variance
     mass = torch.ones(d, dtype=dtype)
-    inv_mass = torch.ones(d, dtype=dtype)
+
+    # warm-up schedule
+    init_buf = int(0.15 * burn_in)
+    adapt_end = burn_in - int(0.10 * burn_in)
+    w, pos, ends = max(50, burn_in // 10), init_buf, []
+    while True:
+        end = pos + w
+        if end + 2 * w > adapt_end:
+            ends.append(adapt_end)
+            break
+        ends.append(end)
+        pos, w = end, w * 2
+    end_idx = 0
+    mean = torch.zeros(d, dtype=dtype)
+    m2 = torch.zeros(d, dtype=dtype)
+    n_w = 0
 
     eps = float(step_size)
     saved, acc_post = 0, 0
     recent: List[float] = []
-
-    # Welford running variance for the position during warm-up.
-    mean = torch.zeros(d, dtype=dtype)
-    m2 = torch.zeros(d, dtype=dtype)
-    n_adapt = 0
+    lo_l, hi_l = max(1, leapfrog_steps // 2), leapfrog_steps + leapfrog_steps // 2
 
     for it in range(total):
         q = theta.detach().clone().requires_grad_(True)
         p0 = torch.randn_like(q) * torch.sqrt(mass)
         lp = logpost(q)
         grad = torch.autograd.grad(lp, q)[0]
+        n_lf = int(rng.integers(lo_l, hi_l + 1))
 
-        # Hamiltonian dynamics for diagonal mass M:
-        # dq/dt = M^{-1} p, dp/dt = grad(log posterior).
         p = p0 + 0.5 * eps * grad
         q_new, valid = q, True
         grad_new = grad
-
-        for lf in range(leapfrog_steps):
+        for lf in range(n_lf):
             q_new = (q_new + eps * inv_mass * p).detach().requires_grad_(True)
             lp_new = logpost(q_new)
             if not torch.isfinite(lp_new):
                 valid = False
                 break
             grad_new = torch.autograd.grad(lp_new, q_new)[0]
-            if lf < leapfrog_steps - 1:
+            if lf < n_lf - 1:
                 p = p + eps * grad_new
 
         accepted = False
@@ -789,39 +830,27 @@ def _hmc_sample(logpost: Callable[[torch.Tensor], torch.Tensor], theta0: np.ndar
             delta = float(cur_h - prop_h)
             log_acc = min(0.0, delta) if np.isfinite(delta) else -np.inf
             if math.log(max(rng.random(), 1e-300)) < log_acc:
-                theta = q_new.detach()
-                accepted = True
-
+                theta, accepted = q_new.detach(), True
         recent.append(1.0 if accepted else 0.0)
 
-        # Warm-up only: learn posterior scale from the accepted/current state.
         if it < burn_in:
-            x = theta.detach()
-            n_adapt += 1
-            delta_x = x - mean
-            mean += delta_x / n_adapt
-            m2 += delta_x * (x - mean)
-
-            # Adapt every 100 warm-up iterations after enough states exist.
-            if (it + 1) % 100 == 0 and n_adapt >= 100:
-                var = m2 / max(n_adapt - 1, 1)
-                var = torch.clamp(var, min=1e-4, max=1e4)
-                # For HMC, a useful diagonal mass is approximately the inverse
-                # posterior variance.  Cap it to avoid extreme momentum scales.
-                new_mass = torch.clamp(1.0 / var, min=1e-3, max=1e3)
-                # Dampen adaptation to avoid abrupt geometry changes.
-                mass = torch.sqrt(mass * new_mass)
-                inv_mass = 1.0 / mass
-
-                rate = float(np.mean(recent[-100:]))
-                # Conservative adaptation; the old exp(2*(rate-target)) was
-                # unnecessarily aggressive for this high-dimensional posterior.
-                eps = float(np.clip(
-                    eps * math.exp(0.5 * (rate - MCMC_TARGET_ACCEPTANCE)),
-                    0.001, 0.25
-                ))
-
-        if it >= burn_in:
+            if it % 25 == 24:
+                rate = float(np.mean(recent[-25:]))
+                eps = float(np.clip(eps * math.exp(rate - MCMC_TARGET_ACCEPTANCE), 1e-3, 0.5))
+            if init_buf <= it < adapt_end:
+                x_cur = theta.detach()
+                n_w += 1
+                dx = x_cur - mean
+                mean += dx / n_w
+                m2 += dx * (x_cur - mean)
+                if end_idx < len(ends) and it + 1 == ends[end_idx]:
+                    var = m2 / max(n_w - 1, 1)
+                    var = (n_w / (n_w + 5.0)) * var + 1e-3 * (5.0 / (n_w + 5.0))
+                    inv_mass = torch.clamp(var, 1e-4, 1e4)
+                    mass = 1.0 / inv_mass
+                    mean.zero_(); m2.zero_(); n_w = 0
+                    end_idx += 1
+        else:
             acc_post += int(accepted)
             if (it - burn_in) % thin == 0:
                 draws[saved, :d] = theta.numpy()
@@ -837,64 +866,346 @@ def _hmc_sample(logpost: Callable[[torch.Tensor], torch.Tensor], theta0: np.ndar
 def _make_crm_posterior(time: np.ndarray, injection: np.ndarray, production: np.ndarray,
                         production_scale: float, tau_min: float, active_mask: np.ndarray,
                         rho_weights: np.ndarray):
-    """Build log-posterior and sigma sampler for the CRM parameters.
-
-    Likelihood: log y ~ Normal(log q_CRM, sigma_j) on positive rows, sigma_j^2 ~
-    InvGamma(a0, b0) marginalised analytically. The log-likelihood is tempered by
-    w_j = (1-rho_j)/(1+rho_j) (lag-1 effective-sample-size correction) because CRM
-    residuals are serially correlated. Priors: log(tau/tau_ref) ~ N(0, UQ_TAU_LOG_SD^2)
-    with tau_ref = sqrt(tau_min * span) (truncated at tau_min), softmax logits
-    ~ N(0, UQ_LAMBDA_LOGIT_SD^2).
     """
+    Build the Bayesian posterior for the CRM parameters.
+
+    This function does NOT run HMC itself.
+    It defines:
+      1. The likelihood: how well a set of CRM parameters explains production.
+      2. The priors: what parameter values are considered plausible.
+      3. The log-posterior: likelihood + prior.
+      4. A function for sampling sigma for diagnostics.
+
+    HMC later calls the logpost() function repeatedly to sample
+    the CRM parameters from their posterior distribution.
+    """
+
+    # Use double precision for the Bayesian calculations.
     dtype = torch.float64
-    t = torch.as_tensor(np.array(time, copy=True), dtype=dtype)
-    w = torch.as_tensor(injection / production_scale, dtype=dtype)
-    q0 = torch.as_tensor(production[0] / production_scale, dtype=dtype)
-    y = torch.as_tensor(production[1:], dtype=dtype)
-    mask_np = np.asarray(active_mask, bool)[1:]
-    mask_t = torch.as_tensor(mask_np, dtype=torch.bool)
-    n_inj, n_prod = injection.shape[1], production.shape[1]
+
+    # Convert the input arrays into PyTorch tensors.
+    # PyTorch is used because HMC needs gradients of the log-posterior.
+    t = torch.as_tensor(
+        np.array(time, dtype=float),
+        dtype=dtype
+    )
+
+    # Injection data, scaled for numerical stability.
+    w = torch.as_tensor(
+        np.array(injection / production_scale, dtype=float),
+        dtype=dtype
+    )
+
+    # Initial production rate for each producer.
+    q0 = torch.as_tensor(
+        np.array(production[0] / production_scale, dtype=float),
+        dtype=dtype
+    )
+
+    # Observed production after the first time step.
+    y = torch.as_tensor(
+        np.array(production[1:], dtype=float),
+        dtype=dtype
+    )
+
+    # Mask indicating which production observations are active/positive.
+    # The Lognormal likelihood cannot use zero or negative production.
+    mask_np = np.array(active_mask, dtype=bool)[1:]
+
+    # Convert the mask to a PyTorch tensor.
+    mask_t = torch.as_tensor(
+        np.array(mask_np, dtype=bool),
+        dtype=torch.bool
+    )
+
+    # Number of injectors and producers.
+    n_inj, n_prod = injection.shape[0], production.shape[0]
+
+    # Number of valid observations for each producer.
     n_obs = mask_np.sum(axis=0).astype(int)
-    span = max(float(time[-1] - time[0]), tau_min * 1.01)
-    log_tau_ref = 0.5 * (math.log(tau_min) + math.log(span))
+
+    # Total historical time span.
+    span = max(
+        float(time[-1] - time[0]),
+        tau_min * 1.01
+    )
+
+    # Reference value for log(tau).
+    #
+    # tau_ref = sqrt(tau_min * span)
+    #
+    # This is the centre of the prior for log(tau).
+    log_tau_ref = 0.5 * (
+        math.log(tau_min) + math.log(span)
+    )
+
+    # Minimum allowed log(tau).
+    # This prevents tau from becoming smaller than tau_min.
     lt_min = math.log(tau_min)
+
+    # Parameters for the inverse-gamma prior on the residual variance.
+    # These are used to analytically marginalise sigma^2 in logpost().
     a0 = 2.0
     b0 = a0 * (0.20 ** 2)
+
+    # Position where the interwell tau parameters begin
+    # inside the HMC parameter vector.
     off = n_prod + n_inj * n_prod
 
+    #Make the Posterior Distribution
     def logpost(th: torch.Tensor) -> torch.Tensor:
-        lt_j, z, lt_ij = th[:n_prod], th[n_prod:off], th[off:off + n_inj * n_prod]
+        """
+        Calculate the log-posterior for one possible CRM parameter set.
+
+        THIS is the function that HMC will repeatedly evaluate.
+
+        HMC proposes a parameter vector 'th', evaluates this function,
+        calculates its gradient, and uses that information to decide
+        how to move through the posterior distribution.
+        """
+
+        # Extract the three groups of CRM parameters from the HMC state:
+        #
+        # lt_j  = log(tau_j)
+        # z     = transformed lambda parameters
+        # lt_ij = log(tau_ij)
+        lt_j, z, lt_ij = (
+            th[:n_prod],
+            th[n_prod:off],
+            th[off:off + n_inj * n_prod]
+        )
+
+        # Reject parameter values that would give tau < tau_min.
         if torch.any(lt_j < lt_min) or torch.any(lt_ij < lt_min):
-            return torch.tensor(-float("inf"), dtype=dtype)
-        qhat = _crm_simulate_torch(th, t, w, q0, n_inj, n_prod) * production_scale
+            return torch.tensor(
+                -float("inf"),
+                dtype=dtype
+            )
+
+        # Run the CRM using this particular parameter set.
+        #
+        # THIS is where the sampled CRM parameters are used to
+        # calculate the corresponding CRM production response.
+        qhat = (
+            _crm_simulate_torch(
+                th,
+                t,
+                w,
+                q0,
+                n_inj,
+                n_prod
+            ) * production_scale
+        )
+
+        # Reject invalid CRM predictions.
         if torch.any(~torch.isfinite(qhat)):
-            return torch.tensor(-float("inf"), dtype=dtype)
+            return torch.tensor(
+                -float("inf"),  
+                dtype=dtype
+            )
+
+        # Start accumulating the log-likelihood.
         ll = torch.tensor(0.0, dtype=dtype)
+
+        # Calculate the likelihood separately for each producer.
         for j in range(n_prod):
+
+            # Select the valid production observations.
             mj = mask_t[:, j]
-            qj = torch.clamp(qhat[:, j][mj], min=1e-12)
-            resid = torch.log(y[:, j][mj]) - torch.log(qj)
+
+            # Select the corresponding CRM predictions.
+            # Clamp prevents log(0).
+            qj = torch.clamp(
+                qhat[:, j][mj],
+                min=1e-12
+            )
+
+            # Log-space production residual:
+            #
+            # log(observed production)
+            #       -
+            # log(CRM predicted production)
+            #
+            # This is the basis of the Lognormal observation model.
+            resid = (
+                torch.log(y[:, j][mj])
+                - torch.log(qj)
+            )
+
+            # Effective-sample-size correction caused by
+            # lag-1 residual correlation.
             wj = float(rho_weights[j])
-            ll = ll - (a0 + 0.5 * wj * n_obs[j]) * torch.log(b0 + 0.5 * wj * torch.sum(resid * resid))
-        prior = -0.5 * torch.sum(((lt_j - log_tau_ref) / UQ_TAU_LOG_SD) ** 2)
-        prior = prior - 0.5 * torch.sum(((lt_ij - log_tau_ref) / UQ_TAU_LOG_SD) ** 2)
-        prior = prior - 0.5 * torch.sum((z / UQ_LAMBDA_LOGIT_SD) ** 2)
+
+            # Add this producer's contribution to the
+            # marginalised log-likelihood.
+            ll = ll - (
+                a0 + 0.5 * wj * n_obs[j]
+            ) * torch.log(
+                b0
+                + 0.5 * wj * torch.sum(resid * resid)
+            )
+
+       
+        # PRIORS
+       
+        # Prior for log(tau_j):
+        #
+        # log(tau_j) ~ Normal(log(tau_ref), UQ_TAU_LOG_SD^2)
+        #
+        # Therefore tau_j has a Lognormal prior on its
+        # original positive scale.
+        prior = -0.5 * torch.sum(
+            (
+                (lt_j - log_tau_ref)
+                / UQ_TAU_LOG_SD
+            ) ** 2
+        )
+
+        # Same type of prior for log(tau_ij).
+        prior = prior - 0.5 * torch.sum(
+            (
+                (lt_ij - log_tau_ref)
+                / UQ_TAU_LOG_SD
+            ) ** 2
+        )
+
+        # Prior for the transformed lambda parameters.
+        #
+        # z is the transformed representation of lambda.
+        # A Normal prior is placed on z.
+        prior = prior - 0.5 * torch.sum(
+            (z / UQ_LAMBDA_LOGIT_SD) ** 2
+        )
+
+        # The posterior is proportional to:
+        #
+        # posterior = likelihood × prior
+        #
+        # In log-space:
+        #
+        # log(posterior) =
+        # log(likelihood) + log(prior)
+        #
         return ll + prior
 
-    def sigma_draw(th: torch.Tensor, rng: np.random.Generator) -> np.ndarray:
-        with torch.no_grad():
-            qhat = _crm_simulate_torch(th, t, w, q0, n_inj, n_prod) * production_scale
-            sig = []
-            for j in range(n_prod):
-                mj = mask_t[:, j]
-                resid = torch.log(y[:, j][mj]) - torch.log(torch.clamp(qhat[:, j][mj], min=1e-12))
-                wj = float(rho_weights[j])
-                shape = a0 + 0.5 * wj * n_obs[j]
-                scale = b0 + 0.5 * wj * float(torch.sum(resid ** 2))
-                sig.append(math.sqrt(_sample_inverse_gamma(shape, scale, rng)))
-        return np.asarray(sig)
 
+    def sigma_draw(
+        th: torch.Tensor,
+        rng: np.random.Generator
+    ) -> np.ndarray:
+        """
+        Draw sigma values for each producer.
+
+        This is NOT the HMC sampler.
+        It is used to obtain residual-uncertainty estimates
+        associated with a particular CRM parameter draw.
+        """
+
+        # No gradients are required for this calculation.
+        with torch.no_grad():
+
+            # Calculate CRM production using the supplied
+            # CRM parameter vector.
+            qhat = (
+                _crm_simulate_torch(
+                    th,
+                    t,
+                    w,
+                    q0,
+                    n_inj,
+                    n_prod
+                ) * production_scale
+            )
+
+            sig = []
+
+            # Calculate sigma separately for each producer.
+            for j in range(n_prod):
+
+                # Select valid production observations.
+                mj = mask_t[:, j]
+
+                # Calculate log-space CRM residuals.
+                resid = (
+                    torch.log(y[:, j][mj])
+                    - torch.log(
+                        torch.clamp(
+                            qhat[:, j][mj],
+                            min=1e-12
+                        )
+                    )
+                )
+
+                # Effective sample correction.
+                wj = float(rho_weights[j])
+
+                # Parameters of the conditional
+                # inverse-gamma distribution.
+                shape = (
+                    a0
+                    + 0.5 * wj * n_obs[j]
+                )
+
+                scale = (
+                    b0
+                    + 0.5 * wj
+                    * float(torch.sum(resid ** 2))
+                )
+
+                # Draw sigma^2 from the inverse-gamma distribution,
+                # then take the square root to obtain sigma.
+                sig.append(
+                    math.sqrt(
+                        _sample_inverse_gamma(
+                            shape,
+                            scale,
+                            rng
+                        )
+                    )
+                )
+
+            return np.asarray(sig)
+
+    # Return the two functions.
+    #
+    # logpost()      → used later by HMC
+    # sigma_draw()   → used to obtain sigma estimates
     return logpost, sigma_draw
+
+def _functional_diagnostics(chain: np.ndarray, logpost, time: np.ndarray, injection: np.ndarray,
+                            q0: np.ndarray, production_scale: float, n_hist: int,
+                            n_inj: int, n_prod: int, producer_names: Sequence[str],
+                            n_keep: int = 150) -> pd.DataFrame:
+    """R-hat / ESS of quantities the forecast depends on, not of the raw parameters.
+
+    Rows: the log-posterior, and for each producer the log CRM rate at the last
+    history step and the log of the mean CRM rate over the forecast window.
+    If these converge (R-hat near 1) while individual lambda/tau do not, the
+    parameters are weakly identified but the CRM response is well determined,
+    and the forecast is not hurt by that. If the log-posterior itself has a high
+    R-hat, the chains sit in different modes and nothing downstream is reliable.
+    Forward evaluations only (no gradients), so this takes seconds.
+    """
+    dtype = torch.float64
+    t = torch.as_tensor(np.array(time, dtype=float), dtype=dtype)
+    w = torch.as_tensor(np.array(injection / production_scale, dtype=float), dtype=dtype)
+    q0t = torch.as_tensor(np.array(q0 / production_scale, dtype=float), dtype=dtype)
+    m, n, width = chain.shape
+    n_theta = width - n_prod
+    idx = np.unique(np.linspace(0, n - 1, min(n_keep, n)).astype(int))
+    vals = np.empty((m, len(idx), 1 + 2 * n_prod))
+    with torch.no_grad():
+        for c in range(m):
+            for k, i in enumerate(idx):
+                th = torch.as_tensor(np.array(chain[c, i, :n_theta], dtype=float), dtype=dtype)
+                vals[c, k, 0] = float(logpost(th))
+                q = _crm_simulate_torch(th, t, w, q0t, n_inj, n_prod).numpy() * production_scale
+                vals[c, k, 1:1 + n_prod] = np.log(np.maximum(q[n_hist - 2], 1e-12))
+                vals[c, k, 1 + n_prod:] = np.log(np.maximum(q[n_hist - 1:].mean(axis=0), 1e-12))
+    names = (["log_posterior"]
+             + [f"{p}::log_q_CRM_last_history" for p in producer_names]
+             + [f"{p}::log_q_CRM_forecast_mean" for p in producer_names])
+    return _diagnostics(vals, names)
 
 
 def _posterior_crm_arrays(chain: np.ndarray, n_inj: int, n_prod: int):
@@ -985,7 +1296,7 @@ def _oos_ml_calibration(model_name: str, data: FieldData, n_hist: int, seed: int
         raise ValueError("History is too short for a leak-free calibration split (need >= 10 rows in the training block).")
     time, inj, prod = data.time[:n_hist], data.injection[:n_hist], data.production[:n_hist]
     cal_crm = CapacitanceResistanceModel(n_starts=crm_starts, max_iter=crm_max_iter,
-                                         random_state=seed).fit(time[:r], inj[:r], prod[:r])
+                                         random_state=seed).fit(time[:r], inj[:r], prod[:r], fit_mask=prod[:r] > 0)
     resp = cal_crm.predict(time, inj, prod[0])  # rows -> time[1:]
     time_idx = np.arange(1, n_hist)
     records, sigma, bias = [], [], []
@@ -1194,7 +1505,7 @@ def run_bayesian_uq(data: FieldData, n_forecast: int, model: str = DEFAULT_CRM_M
                     seed: int = MCMC_DEFAULT_SEED,
                     crm_starts: int = 3, crm_max_iter: int = 300,
                     trim_leading_inactive: bool = False, verbose: bool = True,
-                    hmc_step_size: float = 0.05, hmc_leapfrog_steps: int = 5,
+                    hmc_step_size: float = 0.05, hmc_leapfrog_steps: int = 20,
                     predictive_draws: int = UQ_MAX_CRM_PREDICTIVE_DRAWS,
                     refit_ml_per_draw: bool = True, use_time_feature: bool = True,
                     sigma_growth: float = 0.0) -> BayesianUQResult:
@@ -1228,11 +1539,12 @@ def run_bayesian_uq(data: FieldData, n_forecast: int, model: str = DEFAULT_CRM_M
     if verbose:
         print(f"Positive production rows used in the Lognormal likelihood: {int(active_mask.sum())}")
         print(f"Zero-production/shut-in rows retained but excluded from log-space modelling: {int((hist_prod == 0).sum())}")
+        print("Shut-in rows per producer (history):", dict(zip(data.producer_names, (hist_prod == 0).sum(axis=0).tolist())))
         if trim_leading_inactive:
             print("Note: --trim-leading-inactive is deprecated and has no effect.")
 
     crm = CapacitanceResistanceModel(n_starts=crm_starts, max_iter=crm_max_iter, random_state=seed)
-    crm.fit(hist_time, hist_inj, hist_prod)
+    crm.fit(hist_time, hist_inj, hist_prod, fit_mask=active_mask)
     production_scale = float(crm._scale)
     tau_min = float(np.min(np.diff(hist_time)))
     if verbose:
@@ -1274,6 +1586,13 @@ def run_bayesian_uq(data: FieldData, n_forecast: int, model: str = DEFAULT_CRM_M
             print(f"Bayesian CRM HMC chain {c+1}/{mcmc_chains}: acceptance={rate:.2%}, final step={eps:.4f}")
     chain = np.stack(chains, axis=0)
 
+    func_diag = _functional_diagnostics(
+        chain, logpost, data.time, data.injection, np.asarray(data.production[0], float),
+        production_scale, n_hist, n_inj, n_prod, data.producer_names)
+    if verbose:
+        print("\nFunctional convergence (quantities the forecast depends on):")
+        print(func_diag.round(3).to_string(index=False))
+
     q0 = np.asarray(data.production[0], float)
     posterior_mean_params = _posterior_mean_crm_params(chain, n_inj, n_prod)
     model_name = model.split("-", 1)[1]
@@ -1286,6 +1605,11 @@ def run_bayesian_uq(data: FieldData, n_forecast: int, model: str = DEFAULT_CRM_M
                                               data.production, n_hist, q0, seed, use_time_feature)
     baseline_metrics = _deterministic_forecast_metrics(observed_forecast, baseline_pred,
                                                        data.producer_names, f"{model} deterministic CRM")
+    crm_only_pred = crm_simulate(crm.params_, data.time, data.injection, q0)[n_hist - 1:]
+    _co = _deterministic_forecast_metrics(observed_forecast, crm_only_pred, data.producer_names, "CRM only")
+    baseline_metrics["MAE_CRM_only"] = _co["MAE_P50"].to_numpy()
+    baseline_metrics["RMSE_CRM_only"] = _co["RMSE_P50"].to_numpy()
+    baseline_metrics["R2_CRM_only"] = _co["R2_P50"].to_numpy()
 
     cal_df, ml_sigma, ml_bias = _oos_ml_calibration(model_name, data, n_hist, seed + 700_000,
                                                     UQ_CALIBRATION_FRACTION, crm_starts, crm_max_iter,
@@ -1332,6 +1656,7 @@ def run_bayesian_uq(data: FieldData, n_forecast: int, model: str = DEFAULT_CRM_M
         settings={"refit_ml_per_draw": refit_ml_per_draw, "use_time_feature": use_time_feature,
                   "sigma_growth": sigma_growth, "predictive_draws": int(len(flat)),
                   "rho_weights": rho_w.tolist()},
+        functional_diagnostics=func_diag,
     )
     max_rhat = float(diag["R_hat"].max(skipna=True))
     min_ess = float(diag["ESS_bulk"].min(skipna=True))
@@ -1339,10 +1664,15 @@ def run_bayesian_uq(data: FieldData, n_forecast: int, model: str = DEFAULT_CRM_M
         warnings.warn(f"Maximum R-hat is {max_rhat:.3f}; increase MCMC iterations before treating intervals as final.", RuntimeWarning)
     if np.isfinite(min_ess) and min_ess < UQ_MIN_ESS_WARNING:
         warnings.warn(f"Minimum bulk ESS is {min_ess:.0f} (< {UQ_MIN_ESS_WARNING:.0f}); posterior summaries are noisy.", RuntimeWarning)
+    f_rhat = float(func_diag["R_hat"].max(skipna=True))
+    if np.isfinite(f_rhat) and f_rhat > UQ_RHAT_WARNING:
+        warnings.warn(f"Functional R-hat (log-posterior / CRM rates) is {f_rhat:.3f}: chains disagree on quantities the forecast uses; do not trust the intervals.", RuntimeWarning)
     return result
 
 
+
 # 5b. VALIDATION UTILITIES
+
 
 def rolling_origin_backtest(data: FieldData, n_forecast: int, n_origins: int = 3, **kwargs):
     """Repeat the whole pipeline at several forecast origins and pool coverage.
@@ -1400,7 +1730,9 @@ def synthetic_recovery_check(n_steps: int = 80, n_forecast: int = 12, seed: int 
     return {"parameter_recovery": pd.DataFrame(rows), "forecast_metrics": res.metrics, "diagnostics": res.rhat}
 
 
+
 # 6. FIGURES AND EXPORTS
+
 
 def plot_production_history(data: FieldData, n_hist: Optional[int] = None) -> plt.Figure:
     n_hist = len(data.time) if n_hist is None else int(n_hist)
@@ -1418,30 +1750,70 @@ def plot_production_history(data: FieldData, n_hist: Optional[int] = None) -> pl
     return fig
 
 
-def plot_producer_forecast(result: BayesianUQResult, producer: str, data: FieldData) -> plt.Figure:
-    df = result.forecast[result.forecast["producer"] == producer].sort_values("time")
-    fig, ax = plt.subplots(figsize=(11, 5.5))
-    if df.empty:
-        ax.set_title(f"{producer}: no forecast observations available")
+def _safe_name(name) -> str:
+    return re.sub(r"[^A-Za-z0-9_.-]+", "_", str(name)).strip("_") or "producer"
+
+
+def plot_producer_forecast(result: BayesianUQResult, producer: str, data=None,
+                           max_history: Optional[int] = None,
+                           show_p10_p90: bool = True) -> plt.Figure:
+    """One producer: the whole observed history, a dashed line at the forecast start,
+    then the forecast window with deterministic CRM-ML, Bayesian P50, P90/P10 and the
+    95% interval. The history is always drawn in full unless you pass max_history
+    (number of most recent historical points to keep), for the rare case where it
+    makes the forecast window unreadable."""
+    fc = result.forecast[result.forecast["producer"] == producer].sort_values("time")
+    hist_all = result.historical_production
+    time_unit = getattr(data, "time_unit", DEFAULT_TIME_UNIT)
+    rate_unit = getattr(data, "rate_unit", DEFAULT_RATE_UNIT)
+    fig, ax = plt.subplots(figsize=(12, 5.5))
+    if fc.empty or producer not in hist_all.columns:
+        ax.set_title(f"{producer}: no data available")
         fig.tight_layout()
         return fig
-    ax.plot(df["time"], df["observed"], lw=2.0, label="Observed production")
-    ax.plot(df["time"], df["crm_ml_deterministic"], lw=1.5, linestyle=":", label="Deterministic CRM-ML")
-    ax.plot(df["time"], df["P50"], lw=2.0, linestyle="--", label="Bayesian P50")
-    ax.fill_between(df["time"].to_numpy(float), df["95pct_lower"].to_numpy(float),
-                    df["95pct_upper"].to_numpy(float), alpha=0.20, label="95% predictive interval")
-    ax.axvline(float(df["time"].min()), linestyle="--", lw=1.4, label="Forecast start ($t_f$)")
-    ax.set_xlabel(f"Time [{data.time_unit}]")
-    ax.set_ylabel(f"Production rate [{data.rate_unit}]")
-    ax.set_title(f"{producer} — production and forecast")
+
+    t_f = float(fc["time"].min())
+    t_end = float(fc["time"].max())
+    hist = hist_all[hist_all["time"] < t_f]
+    if max_history is not None and max_history > 0 and len(hist) > max_history:
+        hist = hist.iloc[-int(max_history):]
+
+    ax.axvspan(t_f, t_end, color="0.94", zorder=0)
+    ax.plot(hist["time"], hist[producer], color="0.25", lw=1.6, label="Observed (historical)")
+    ax.axvline(t_f, color="k", linestyle="--", lw=1.3, label="Forecast start ($t_f$)")
+    ax.plot(fc["time"], fc["observed"], color="tab:blue", lw=2.0, marker="o", ms=3,
+            label="Observed (forecast window)")
+    ax.plot(fc["time"], fc["crm_ml_deterministic"], color="tab:green", lw=1.4, linestyle=":",
+            label="Deterministic CRM-ML")
+    ax.plot(fc["time"], fc["P50"], color="tab:red", lw=2.0, linestyle="--", label="Bayesian P50")
+    if show_p10_p90:
+        ax.plot(fc["time"], fc["P90_low"], color="tab:red", lw=0.9, linestyle="-.", alpha=0.6,
+                label="P90 (low case)")
+        ax.plot(fc["time"], fc["P10_high"], color="tab:red", lw=0.9, linestyle="-.", alpha=0.6,
+                label="P10 (high case)")
+    ax.fill_between(fc["time"].to_numpy(float), fc["95pct_lower"].to_numpy(float),
+                    fc["95pct_upper"].to_numpy(float), color="tab:red", alpha=0.18,
+                    label="95% predictive interval")
+    ax.set_ylim(bottom=0)
+    ymax = ax.get_ylim()[1]
+    ax.text(t_f, ymax, "  Forecast window \u2192", ha="left", va="top", fontsize=9, color="0.3")
+    ax.text(t_f, ymax, "Historical \u2190  ", ha="right", va="top", fontsize=9, color="0.3")
+    ax.set_xlabel(f"Time [{time_unit}]")
+    ax.set_ylabel(f"Production rate [{rate_unit}]")
+    ax.set_title(f"{producer} \u2014 history and forecast")
     ax.grid(alpha=0.2)
-    ax.legend(fontsize=9)
+    ax.legend(fontsize=8, ncol=2, loc="lower left")
     fig.tight_layout()
     return fig
 
 
-def plot_forecast_test(result: BayesianUQResult, data: FieldData) -> plt.Figure:
+def plot_forecast_test(result: BayesianUQResult, data: FieldData,
+                       producers: Optional[Sequence[str]] = None) -> plt.Figure:
+    """Held-out window: observed, deterministic CRM-ML, Bayesian P50 and 95% interval.
+    Pass producers=[name] to get a single-producer figure."""
     df = result.forecast
+    if producers is not None:
+        df = df[df["producer"].isin(list(producers))]
     fig, ax = plt.subplots(figsize=(12, 5.5))
     for pname in df["producer"].unique():
         d = df[df["producer"] == pname].sort_values("time")
@@ -1454,9 +1826,12 @@ def plot_forecast_test(result: BayesianUQResult, data: FieldData) -> plt.Figure:
         ax.axvline(float(df["time"].min()), linestyle="--", lw=1.5, label="Forecast start (t_f)")
     ax.set_xlabel(f"Time [{data.time_unit}]")
     ax.set_ylabel(f"Production rate [{data.rate_unit}]")
-    ax.set_title("Held-out production test: deterministic CRM-ML vs Bayesian CRM-ML")
+    title = "Held-out production test: deterministic CRM-ML vs Bayesian CRM-ML"
+    if producers is not None and len(producers) == 1:
+        title = f"{producers[0]} \u2014 held-out production test"
+    ax.set_title(title)
     ax.grid(alpha=0.2)
-    ax.legend(fontsize=7, ncol=2)
+    ax.legend(fontsize=7 if producers is None else 9, ncol=2)
     fig.tight_layout()
     return fig
 
@@ -1520,7 +1895,8 @@ def plot_mcmc_diagnostics(result: BayesianUQResult) -> plt.Figure:
     return fig
 
 
-def export_result(result: BayesianUQResult, folder: Union[str, Path], rate_unit: str) -> List[Path]:
+def export_result(result: BayesianUQResult, folder: Union[str, Path], rate_unit: str,
+                  time_unit: str = DEFAULT_TIME_UNIT) -> List[Path]:
     folder = Path(folder)
     folder.mkdir(parents=True, exist_ok=True)
     result.forecast.to_csv(folder / "uq_forecast.csv", index=False)
@@ -1528,27 +1904,44 @@ def export_result(result: BayesianUQResult, folder: Union[str, Path], rate_unit:
     result.baseline_metrics.to_csv(folder / "deterministic_baseline_metrics.csv", index=False)
     result.posterior_summary.to_csv(folder / "uq_posterior_summary.csv", index=False)
     result.rhat.to_csv(folder / "uq_rhat_ess.csv", index=False)
+    if getattr(result, "functional_diagnostics", None) is not None:
+        result.functional_diagnostics.to_csv(folder / "uq_functional_diagnostics.csv", index=False)
     result.acceptance_rates.to_csv(folder / "uq_acceptance_rates.csv", index=False)
     pd.DataFrame({"producer": result.forecast["producer"].unique(), "sigma_ML_oos_rms": result.ml_sigma,
                   "mean_log_residual_bias": result.ml_bias if result.ml_bias is not None else np.nan}
                  ).to_csv(folder / "uq_ml_aleatoric_sigma.csv", index=False)
     result.calibration_predictions.to_csv(folder / "uq_ml_calibration_predictions.csv", index=False)
     result.historical_production.to_csv(folder / "historical_production.csv", index=False)
-    pd.DataFrame(result.settings.items(), columns=["setting", "value"]).astype(str).to_csv(folder / "run_settings.csv", index=False)
+    pd.DataFrame(result.settings.items(), columns=["setting", "value"]).astype(str).to_csv(
+        folder / "run_settings.csv", index=False)
     pd.DataFrame(result.posterior_mean_params.lambda_ij).to_csv(folder / "posterior_mean_lambda.csv", index=False)
     pd.DataFrame(result.posterior_mean_params.tau_ij).to_csv(folder / "posterior_mean_tau_ij.csv", index=False)
     pd.DataFrame({"tau_j": result.posterior_mean_params.tau_j}).to_csv(folder / "posterior_mean_tau_j.csv", index=False)
     np.savez_compressed(folder / "uq_mcmc_samples.npz", chain_samples=result.chain_samples)
+
     hp = result.historical_production
     stub = FieldData(time=hp["time"].to_numpy(float), production=hp.drop(columns=["time"]).to_numpy(float),
                      injection=np.empty((len(hp), 0)), distances=np.empty((0, len(hp.columns) - 1)),
-                     producer_names=list(hp.columns[1:]), injector_names=[])
-    figs = {"uq_forecast.png": plot_uq_forecast(result, rate_unit),
-            "uq_mcmc_diagnostics.png": plot_mcmc_diagnostics(result),
-            "uq_forecast_test_with_interval.png": plot_forecast_test(result, stub),
-            "uq_ml_calibration_residuals.png": plot_ml_calibration(result)}
-    for fname, fig in figs.items():
+                     producer_names=list(hp.columns[1:]), injector_names=[],
+                     time_unit=time_unit, rate_unit=rate_unit)
+
+    # one figure per producer, history included
+    for pname in result.forecast["producer"].unique():
+        fig = plot_producer_forecast(result, pname, stub)
+        fig.savefig(folder / f"uq_forecast_{_safe_name(pname)}.png", dpi=200, bbox_inches="tight")
+        plt.close(fig)
+
+    other = {"uq_mcmc_diagnostics.png": plot_mcmc_diagnostics(result),
+             "uq_forecast_test_with_interval.png": plot_forecast_test(result, stub),
+             "uq_ml_calibration_residuals.png": plot_ml_calibration(result)}
+    for fname, fig in other.items():
         fig.savefig(folder / fname, dpi=200, bbox_inches="tight")
+        plt.close(fig)
+
+    # the same held-out test plot, one file per producer (in addition to the combined one)
+    for pname in result.forecast["producer"].unique():
+        fig = plot_forecast_test(result, stub, [pname])
+        fig.savefig(folder / f"uq_forecast_test_with_interval_{_safe_name(pname)}.png", dpi=200, bbox_inches="tight")
         plt.close(fig)
     return sorted(folder.iterdir())
 
@@ -1571,10 +1964,12 @@ def _print_report(result: BayesianUQResult) -> None:
     print(result.rhat.round(3).to_string(index=False))
 
 
+
 # 7. CLI / STREAMLIT GUI
 
+
 def main(argv: Optional[Sequence[str]] = None) -> None:
-    parser = argparse.ArgumentParser(description="Bayesian UQ CRM-ML production forecasting (v2)")
+    parser = argparse.ArgumentParser(description="Bayesian UQ CRM-ML production forecasting (v4)")
     parser.add_argument("--data", help="Excel workbook with Time, q_Observed, w_Injection and Distances")
     parser.add_argument("--forecast", type=int, default=12, help="Final time steps treated as forecast (default: 12)")
     parser.add_argument("--model", choices=CRM_ML_MODELS, default=DEFAULT_CRM_ML_MODEL)
@@ -1585,7 +1980,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     parser.add_argument("--mcmc-burnin", type=int, default=MCMC_DEFAULT_BURN_IN)
     parser.add_argument("--mcmc-thin", type=int, default=MCMC_DEFAULT_THIN)
     parser.add_argument("--hmc-step-size", type=float, default=0.05)
-    parser.add_argument("--hmc-leapfrog-steps", type=int, default=8)
+    parser.add_argument("--hmc-leapfrog-steps", type=int, default=20)
     parser.add_argument("--predictive-draws", type=int, default=UQ_MAX_CRM_PREDICTIVE_DRAWS,
                         help="Posterior CRM draws propagated through CRM-ML (default 200)")
     parser.add_argument("--no-refit", action="store_true",
@@ -1634,7 +2029,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     result = run_bayesian_uq(data, n_forecast=args.forecast, trim_leading_inactive=args.trim_leading_inactive,
                              verbose=not args.quiet, **common)
     _print_report(result)
-    paths = export_result(result, args.out, data.rate_unit)
+    paths = export_result(result, args.out, data.rate_unit, data.time_unit)
     if args.backtest > 0:
         per_origin, pooled = rolling_origin_backtest(data, args.forecast, args.backtest, **common)
         per_origin.to_csv(Path(args.out) / "backtest_per_origin.csv", index=False)
@@ -1672,7 +2067,7 @@ def run_gui() -> None:
         burnin = st.number_input("Burn-in iterations", 100, 20000, MCMC_DEFAULT_BURN_IN, 100)
         thin = st.number_input("Thinning interval", 1, 20, MCMC_DEFAULT_THIN, 1)
         hmc_step = st.number_input("Initial HMC step size", 0.005, 0.50, 0.05, 0.005, format="%.3f")
-        hmc_leapfrog = st.number_input("HMC leapfrog steps", 1, 20, 5, 1)
+        hmc_leapfrog = st.number_input("HMC leapfrog steps (mean; jittered 0.5x-1.5x)", 1, 100, 20, 1)
         seed = st.number_input("Random seed", 0, 999999, MCMC_DEFAULT_SEED, 1)
         run = st.button("Run Bayesian UQ", type="primary", use_container_width=True)
 
@@ -1766,6 +2161,9 @@ def run_gui() -> None:
         st.pyplot(f, use_container_width=True)
         plt.close(f)
         st.dataframe(result.rhat.round(4), use_container_width=True)
+        if result.functional_diagnostics is not None:
+            st.markdown("### Functional convergence (log-posterior and CRM rates)")
+            st.dataframe(result.functional_diagnostics.round(4), use_container_width=True)
         st.dataframe(result.acceptance_rates.round(4), use_container_width=True)
     with tabs[5]:
         st.dataframe(result.posterior_summary.round(5), use_container_width=True)
@@ -1781,7 +2179,7 @@ def run_gui() -> None:
                                    "tau_j": result.posterior_mean_params.tau_j}).round(5), use_container_width=True)
     with tabs[6]:
         with tempfile.TemporaryDirectory() as tmp:
-            files = export_result(result, tmp, data.rate_unit)
+            files = export_result(result, tmp, data.rate_unit, data.time_unit)
             import zipfile
             buf = io.BytesIO()
             with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:

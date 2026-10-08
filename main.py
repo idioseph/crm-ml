@@ -14,46 +14,6 @@
 # ]
 # ///
 
-"""Paper-faithful CRM-ML production forecasting implementation.
-
-Reference
----------
-Ogali, O.I.O. and Orodu, O.D. (2025).
-"Concatenating data-driven and reduced-physics models for smart production
-forecasting."
-DOI: 10.1007/s12145-025-01745-9
-
-Important replication rule
---------------------------
-This program separates:
-    1. settings explicitly supported by the article, and
-    2. numerical/software settings that the article does not specify.
-
-It therefore does NOT silently attribute solver settings, ML hyperparameters,
-scaling, or the demonstration dataset to the paper.
-
-The built-in demonstration field is clearly labelled as a demonstration.
-For exact numerical reproduction of the published curves, the original
-synfield/Buffalo input data are required.
-
-Paper protocol implemented here
---------------------------------
-- 9 approaches: CRM, four CRM-ML hybrids, four standalone ML models.
-- CRM-ML feature vector: 4I + 2 inputs.
-- Standalone ML input: historical injection rates.
-- MLP: one hidden layer with 10 neurons.
-- ANN-based models: randomized 75:25 historical train/validation split.
-- 20 evaluations.
-- CRM minimum tau: at least one sampling-time unit.
-- Buffalo CRM: BHP term disabled.
-- Overall ranking: combines the five paper cases and their 20 evaluations (560 producer-evaluation groups).
-
-The plotting code uses descriptive engineering labels instead of unexplained
-symbol-only labels. The published article's exact numerical figures cannot be
-reconstructed from plotting code alone when the underlying data are absent.
-The program therefore also provides a PDF-reference extraction utility for
-the actual published figures/pages.
-"""
 from __future__ import annotations
 
 import argparse
@@ -98,9 +58,9 @@ PathLike = Union[str, Path, BinaryIO]
 DEFAULT_RATE_UNIT = "MSTB/day"  # unit used in the article
 DEFAULT_TIME_UNIT = "days"
 
-# ---------------------------------------------------------------------------
+
 # PAPER-SUPPORTED SETTINGS
-# ---------------------------------------------------------------------------
+
 PAPER_N_EVALUATIONS = 20
 PAPER_MLP_HIDDEN_NEURONS = 10
 PAPER_TRAIN_FRACTION = 0.75
@@ -130,21 +90,21 @@ PAPER_CASES = (
 )
 
 
-# 1. ERROR METRICS (paper Eqs. 3-5)
+# 1. ERROR METRICS
 
 
 def mean_absolute_error(q_obs: FloatArray, q_est: FloatArray) -> float:
-    """Eq. 3: MAE = (1/N) * sum |q_est - q_obs| (same unit as the rates)."""
+    """MAE = (1/N) * sum |q_est - q_obs| (same unit as the rates)."""
     return float(np.mean(np.abs(q_est - q_obs)))
 
 
 def root_mean_squared_error(q_obs: FloatArray, q_est: FloatArray) -> float:
-    """Eq. 4: RMSE = sqrt((1/N) * sum (q_est - q_obs)^2) (same unit as the rates)."""
+    """sqrt((1/N) * sum (q_est - q_obs)^2) (same unit as the rates)."""
     return float(np.sqrt(np.mean((q_est - q_obs) ** 2)))
 
 
 def r_squared(q_obs: FloatArray, q_est: FloatArray) -> float:
-    """Eq. 5: R2 as the squared correlation between observed and estimated rates.
+    """R2 as the squared correlation between observed and estimated rates.
 
     Returns:
         A value in [0, 1], or NaN when either series has zero variance.
@@ -421,8 +381,7 @@ def write_template(path: Union[str, Path], n_steps: int = 36, n_injectors: int =
                            rng.uniform(500, 3000, (n_injectors, n_producers)))
 
 
-# 3. CAPACITANCE-RESISTANCE MODEL (Eq. 1) AND ITS CALIBRATION (Eq. 2)
-
+# 3. CAPACITANCE-RESISTANCE MODEL AND ITS CALIBRATION
 
 @dataclass
 class CRMParameters:
@@ -454,7 +413,7 @@ def _exp_filter(signal: FloatArray, dt: FloatArray, tau: float) -> FloatArray:
 
 def crm_simulate(params: CRMParameters, time: FloatArray, injection: FloatArray,
                  q0: FloatArray, bhp: Optional[FloatArray] = None) -> FloatArray:
-    """Evaluates Eq. 1: q_hat = Production term + Injection term (+ BHP term).
+    """Evaluates q_hat = Production term + Injection term (+ BHP term).
 
     Args:
         params: CRM parameters.
@@ -483,9 +442,9 @@ def crm_simulate(params: CRMParameters, time: FloatArray, injection: FloatArray,
 
 
 class CapacitanceResistanceModel:
-    """CRM calibrated by constrained optimisation (SLSQP) of Eq. 2.
+    """CRM calibrated by constrained optimisation (SLSQP).
 
-    Constraints (paper): 0 <= lambda_ij <= 1; sum_j lambda_ij <= 1 per injector;
+    0 <= lambda_ij <= 1; sum_j lambda_ij <= 1 per injector;
     tau >= tau_min (default: the sampling interval). All producers are fitted
     concurrently; time constants are optimised in log-space and rates are
     normalised internally for numerical conditioning.
@@ -753,9 +712,7 @@ def _fit_predict_ml(name: str, features: FloatArray, target: FloatArray,
         val_mae = mean_absolute_error(target[val_idx], model.predict(features[val_idx]))
     return np.asarray(model.predict(features), float), val_mae
 
-
 # 5. STUDIES, RANKING AND THE PIPELINE
-
 
 def run_forecast_study(time, injection, production, distances, n_forecast: int,
                        n_evaluations: int = PAPER_N_EVALUATIONS, bhp=None,
@@ -848,7 +805,6 @@ def run_forecast_study(time, injection, production, distances, n_forecast: int,
                 print(f"  {name}: evaluation {e + 1}/{n_runs} done")
         preds[f"CRM-{name}"], preds[name] = hyb.copy(), mlp.copy()
     return pd.DataFrame.from_records(records), crm, preds
-
 
 def run_precomputed_crm_study(time, production, q_crm, n_forecast: int,
                               n_evaluations: int = PAPER_N_EVALUATIONS,
@@ -1404,9 +1360,9 @@ def plot_crm_parameters(out: StudyOutput) -> Figure:
     return fig
 
 
-# ---------------------------------------------------------------------------
+
 # Exact article figure reference support
-# ---------------------------------------------------------------------------
+
 
 ARTICLE_FIGURE_PAGES = {
     8: 19, 9: 20, 10: 21, 11: 22, 12: 23, 13: 24,
@@ -1505,9 +1461,9 @@ def make_figures(out: StudyOutput) -> Dict[str, Figure]:
     return figures
 
 
-# ---------------------------------------------------------------------------
+
 # Overall paper ranking across the five cases
-# ---------------------------------------------------------------------------
+
 
 def combine_paper_case_results(case_results: Dict[str, pd.DataFrame]) -> pd.DataFrame:
     """Combine the five paper cases before calculating the overall ranking.
@@ -1630,9 +1586,9 @@ def rank_overall_paper_cases(
     return ranking
 
 
-# ---------------------------------------------------------------------------
+
 # Output export
-# ---------------------------------------------------------------------------
+
 
 def export_outputs(out: StudyOutput, folder: Union[str, Path], dpi: int = 200) -> List[Path]:
     """Export descriptive figures, metrics and calibrated CRM parameters."""
