@@ -1307,51 +1307,95 @@ def main() -> None:
         }
     ).to_csv(output_directory / "run_settings.csv", index=False)
 
-    # Create one combined plot showing observed production, posterior median, and the
-    # 95% parameter-induced interval for each producer.
-    figure, axis = plt.subplots(figsize=(11, 6))
+    # Create one separate plot for each producer.
+    # No overall/combined producer plot is generated.
     plot_data = pd.DataFrame(rows)
+    wells_directory = output_directory / "wells"
+    wells_directory.mkdir(parents=True, exist_ok=True)
+
+    # Keep filenames safe for Windows/Linux filesystems while retaining the actual
+    # producer name in the plot title.
+    def safe_filename(name: str) -> str:
+        """Convert a producer name into a filesystem-safe PNG filename."""
+        cleaned = "".join(
+            character if character.isalnum() or character in "-_" else "_"
+            for character in str(name)
+        )
+        return cleaned.strip("_") or "producer"
 
     for producer_name in data.producer_names:
-        producer_data = plot_data[plot_data.producer == producer_name]
+        # Select only the current producer so every figure contains exactly one well.
+        producer_data = plot_data[
+            plot_data["producer"] == producer_name
+        ].sort_values("time")
+
+        if producer_data.empty:
+            progress(f"No plotting data found for {producer_name}; skipping plot.")
+            continue
+
+        # Create a fresh figure for this producer. This is deliberately inside the
+        # producer loop so figures cannot accidentally contain multiple wells.
+        figure, axis = plt.subplots(figsize=(11, 6))
+
+        # Plot the actual observed production for this well.
         axis.plot(
-            producer_data.time,
-            producer_data.observed,
-            label=f"{producer_name} observed",
-            linewidth=0.8,
+            producer_data["time"].to_numpy(float),
+            producer_data["observed"].to_numpy(float),
+            label="Observed production",
+            linewidth=1.6,
         )
+
+        # Plot the posterior median CRM production prediction.
         axis.plot(
-            producer_data.time,
-            producer_data.P50,
-            label=f"{producer_name} P50",
-            linewidth=1.4,
+            producer_data["time"].to_numpy(float),
+            producer_data["P50"].to_numpy(float),
+            label="CRM P50",
+            linewidth=1.8,
+            linestyle="--",
         )
+
+        # Shade the 95% posterior parameter-induced uncertainty interval.
         axis.fill_between(
-            producer_data.time.to_numpy(),
-            producer_data["95pct_lower"].to_numpy(),
-            producer_data["95pct_upper"].to_numpy(),
-            alpha=0.15,
+            producer_data["time"].to_numpy(float),
+            producer_data["95pct_lower"].to_numpy(float),
+            producer_data["95pct_upper"].to_numpy(float),
+            alpha=0.20,
+            label="95% posterior interval",
         )
 
-    # Mark the point at which the requested forecast portion begins.
-    axis.axvline(
-        float(data.time[n_history - 1]),
-        linestyle="--",
-        label="forecast start",
-    )
+        # Mark the historical/forecast boundary. The CRM itself is evaluated over the
+        # complete historical + forecast timeline; this line only identifies the split.
+        forecast_boundary = float(data.time[n_history - 1])
+        axis.axvline(
+            forecast_boundary,
+            linestyle=":",
+            linewidth=1.5,
+            label="Forecast boundary",
+        )
 
-    # Add labels and a compact legend so the figure can be used in a report.
-    axis.set_xlabel("Time")
-    axis.set_ylabel("Production rate")
-    axis.set_title("Bayesian CRM parameter-level uncertainty")
-    axis.grid(alpha=0.2)
-    axis.legend(fontsize=8, ncol=2)
-    figure.tight_layout()
-    figure.savefig(
-        output_directory / "bayesian_crm_parameter_uq.png",
-        dpi=200,
-    )
-    plt.close(figure)
+        # Use the actual producer name as the title so the plot is immediately identifiable.
+        axis.set_title(
+            f"{producer_name} — Bayesian CRM parameter-level uncertainty"
+        )
+        axis.set_xlabel("Time")
+        axis.set_ylabel("Production rate")
+        axis.grid(alpha=0.2)
+        axis.legend(fontsize=9)
+        figure.tight_layout()
+
+        # Save only this producer's figure. There is intentionally no
+        # bayesian_crm_parameter_uq.png combined output anymore.
+        figure.savefig(
+            wells_directory / f"{safe_filename(producer_name)}.png",
+            dpi=200,
+            bbox_inches="tight",
+        )
+        plt.close(figure)
+
+        progress(
+            f"Saved individual well plot: "
+            f"{wells_directory / f'{safe_filename(producer_name)}.png'}"
+        )
 
     # Confirm that output generation has completed before printing the final summary.
     finished(stage_start, "Outputs generated")
