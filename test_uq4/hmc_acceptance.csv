@@ -1,0 +1,3 @@
+chain,acceptance_rate,final_step_size,divergences,unique_retained_fraction
+1,0.76,0.000224086592285736,85,0.76
+2,0.58,0.0007679429544011175,93,0.58
