@@ -1,0 +1,20 @@
+{
+ "data": "buffalo_field.xlsx",
+ "forecast": 12,
+ "tau_min": 0.0328515111695138,
+ "starts": 8,
+ "max_iter": 1000,
+ "likelihood": "normal",
+ "chains": 4,
+ "warmup": 1000,
+ "samples": 1000,
+ "tau_prior_sd": 2.0,
+ "alpha": 1.0,
+ "p_convention": "percentile",
+ "seed": 2025,
+ "out": "results_crm",
+ "self_test": false,
+ "synthetic_check": false,
+ "reps": 3,
+ "noise": 1.0
+}
