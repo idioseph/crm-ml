@@ -1168,21 +1168,60 @@ def plot_producer(path, t, H, obs, start, band, param_band, best, title, labels,
     if param_band is not None:
         ax.fill_between(t, param_band["P10"], param_band["P90"], color=blue, alpha=0.35, lw=0,
                         label=f"{labels['P10']}-{labels['P90']} from CRM parameters only")
-    ax.plot(t, band["P90"], color=blue_dark, lw=1.2, ls="--", label=labels["P90"])
-    ax.plot(t, band["P50"], color=blue, lw=2.2, label=labels["P50"])
-    ax.plot(t, band["P10"], color=blue_dark, lw=1.2, ls=":", label=labels["P10"])
+    ax.plot(t, band["P90"], color=blue_dark, lw=1.0, ls="--", label=labels["P90"])
+    ax.plot(t, band["P50"], color=blue, lw=1.0, label=labels["P50"])
+    ax.plot(t, band["P10"], color=blue_dark, lw=1.0, ls=":", label=labels["P10"])
     if ref is not None:
-        ax.plot(t, ref, color=muted, lw=1.2, label=ref_label)
-    ax.plot(t, best, color=orange, lw=1.4, ls="-.", label="best-fitting posterior draw (history)")
-    ax.plot(t[start:], obs[start:], color=ink, lw=1, marker="o", ms=2.5, label="observed")
+        ax.plot(t, ref, color=muted, lw=1.0, label=ref_label)
+    ax.plot(t, best, color=orange, lw=1.0, ls="-.", label="best-fitting posterior draw (history)")
+    ax.plot(t[start:], obs[start:], color=ink, lw=1.0, marker="o", ms=2.5, label="observed")
     ax.set_title(title, fontsize=11, color=ink, loc="left")
-    ax.set_xlabel("time (data time units)")
-    ax.set_ylabel("liquid production rate")
+    ax.set_xlabel("Time (Unit)")
+    ax.set_ylabel("q (Unit)")
     ax.set_ylim(bottom=0)
     ax.grid(alpha=0.15)
     for sp in ("top", "right"):
         ax.spines[sp].set_visible(False)
     ax.legend(fontsize=7.5, frameon=False, loc="upper left", bbox_to_anchor=(1.01, 1.0))
+    fig.tight_layout()
+    fig.savefig(path, dpi=150)
+    plt.close(fig)
+
+
+def plot_parameter_posteriors(path, tau_j, lam, tau_ij, j, pname, injectors):
+    """Plot the posterior distributions of CRM parameters for a specific producer."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    
+    I = len(injectors)
+    fig = plt.figure(figsize=(10, 3 * (I + 1)))
+    
+    # Plot tau_j on the top row spanning all columns
+    ax_tau_j = plt.subplot(I + 1, 1, 1)
+    ax_tau_j.hist(tau_j, bins=50, density=True, color="#2a78d6", alpha=0.7, edgecolor='none')
+    ax_tau_j.set_title(f"Producer Time Constant: tau_j")
+    ax_tau_j.grid(alpha=0.15)
+    ax_tau_j.set_ylabel("Density")
+    ax_tau_j.set_xlabel("Value")
+    
+    # Plot lambda_ij and tau_ij for each injector
+    for i, iname in enumerate(injectors):
+        ax_lam = plt.subplot(I + 1, 2, 2 * (i + 1) + 1)
+        ax_lam.hist(lam[:, i], bins=50, density=True, color="#184f95", alpha=0.7, edgecolor='none')
+        ax_lam.set_title(f"Connectivity: lambda ({iname} -> {pname})")
+        ax_lam.grid(alpha=0.15)
+        ax_lam.set_ylabel("Density")
+        ax_lam.set_xlabel("Value")
+        
+        ax_tij = plt.subplot(I + 1, 2, 2 * (i + 1) + 2)
+        ax_tij.hist(tau_ij[:, i], bins=50, density=True, color="#eb6834", alpha=0.7, edgecolor='none')
+        ax_tij.set_title(f"Delay: tau_ij ({iname} -> {pname})")
+        ax_tij.grid(alpha=0.15)
+        ax_tij.set_ylabel("Density")
+        ax_tij.set_xlabel("Value")
+    
+    fig.suptitle(f"Posterior Parameter Distributions: {pname}", fontsize=14, y=0.99)
     fig.tight_layout()
     fig.savefig(path, dpi=150)
     plt.close(fig)
@@ -1305,6 +1344,12 @@ def run_pipeline(a, ml_models=("xgb",)):
     tau_j, lam, tau_ij, sig = physical(grouped, J)
     phi = grouped["phi"].reshape(-1, J) if lik == "ar1" else None
     D = len(tau_j)
+    
+    # NEW CODE: Generate and save posterior distributions for CRM parameters
+    for j, pname in enumerate(d.producers):
+        f_post = out / "plots" / f"Posterior_Params_{safe_name(pname)}.png"
+        plot_parameter_posteriors(f_post, tau_j[:, j], lam[:, :, j], tau_ij[:, :, j], j, pname, d.injectors)
+
     names = ([f"tau_j[{n}]" for n in d.producers] + [f"lambda[{i}->{p}]" for i in d.injectors for p in d.producers]
              + [f"tau_ij[{i}->{p}]" for i in d.injectors for p in d.producers] + [f"sigma[{n}]" for n in d.producers]
              + ([f"phi[{n}]" for n in d.producers] if phi is not None else []))
