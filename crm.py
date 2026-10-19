@@ -17,12 +17,6 @@ What it does, in order
 The last --forecast rows are never used for fitting, sampling, or choosing anything.
 See crm_bayes_uq.md for the full documentation.
 
-Usage
-  python crm_bayes_uq.py --data buffalo_field.xlsx --forecast 12
-  python crm_bayes_uq.py --data buffalo_field.xlsx --likelihood ar1 --warmup 2000 --samples 2000
-  python crm_bayes_uq.py --data buffalo_field.xlsx --synthetic-check --reps 3
-  python crm_bayes_uq.py --self-test
-
 Requires: numpy pandas scipy torch jax numpyro matplotlib openpyxl
 """
 from __future__ import annotations

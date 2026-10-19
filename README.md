@@ -44,7 +44,6 @@ Recommended toolchain:
    python --version
    uv --version
    ```
-
 2. Clone the repository.
 
    ```bash
@@ -58,11 +57,9 @@ Recommended toolchain:
    ```
 
    This installs the Python dependencies declared in `pyproject.toml`, including NumPy, SciPy, pandas, JAX, NumPyro, scikit-learn, XGBoost, torch, and matplotlib.
-
 4. Prepare your data file.
 
    Put your Excel workbook in the project directory or another accessible path, and ensure it contains the expected worksheets (for example, `time`, `q_observed`, and `w_injection`), you can check `buffalo_field.xlsx` as a refrence.
-
 5. Run the project.
 
    ```bash

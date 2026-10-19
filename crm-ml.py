@@ -620,9 +620,15 @@ def make_model(t, w, starts, q0, y, likelihood, tau_min, tau_max, tau_mu=np.log(
         log_tau_j = numpyro.sample("log_tau_j", dist.Uniform(lo, hi).expand([J]).to_event(1))
         log_tau_ij = numpyro.sample("log_tau_ij", dist.Uniform(lo, hi).expand([I, J]).to_event(2))
         numpyro.factor("tau_prior", prior.log_prob(log_tau_j).sum() + prior.log_prob(log_tau_ij).sum())
-        lam_full = numpyro.sample("lam_full", dist.Dirichlet(alpha * jnp.ones(J + 1)).expand([I]).to_event(1))
+        
+        # REMOVED the + 1 to enforce sum(lambda) == 1.0 exactly (no slack)
+        lam_full = numpyro.sample("lam_full", dist.Dirichlet(alpha * jnp.ones(J)).expand([I]).to_event(1))
+        
         sigma = numpyro.sample("sigma", dist.HalfNormal(jnp.asarray(sigma_scale)).to_event(1))
-        mu = crm_jax(jnp.exp(log_tau_j), lam_full[:, :J], jnp.exp(log_tau_ij), t, w, starts, q0)
+        
+        # Using lam_full directly since it is now exactly size J
+        mu = crm_jax(jnp.exp(log_tau_j), lam_full, jnp.exp(log_tau_ij), t, w, starts, q0)
+        
         if likelihood == "ar1":
             # Conditional AR(1) residual likelihood: e_n = y_n - mu_n,
             # e_n | e_{n-1} ~ N(phi_j e_{n-1}, sigma_j) for rows whose previous row is
@@ -637,44 +643,30 @@ def make_model(t, w, starts, q0, y, likelihood, tau_min, tau_max, tau_mu=np.log(
             with numpyro.handlers.mask(mask=mask):
                 numpyro.sample("obs", dist.Normal(loc, scale), obs=ytr)
             return
+            
         if likelihood == "normal":
             loc = mu
         else:
             loc = jnp.log(jnp.clip(mu, 1e-8))
+            
         with numpyro.handlers.mask(mask=mask):
             numpyro.sample("obs", dist.Normal(loc, sigma[None, :]), obs=ytr)
-
     return model, int(np.asarray(mask).sum()), int((after & (np.asarray(y) <= 0)).sum())
 
 
 def init_values(p, J, sigma, tau_min=None, tau_max=None, phi=None):
-    """Construct interior NUTS starting values from a deterministic CRM solution.
-
-    Parameters:
-        p: Deterministic CRM parameter set.
-        J: Number of producers.
-        sigma: Initial observation-noise scale.
-        tau_min: Lower tau bound used when clipping the initial log-values.
-        tau_max: Upper tau bound used when clipping the initial log-values.
-        phi: Optional AR(1) coefficients for likelihood startup.
-
-    Returns:
-        A dictionary of NumPyro initial values for the log-parameter, Dirichlet slack, and noise terms.
-
-    Side effects:
-        None; it only clips and reshapes the deterministic fit into sampler-friendly values.
-    """
+    """Construct interior NUTS starting values from a deterministic CRM solution."""
     if tau_min is not None:
         lo, hi = np.log(tau_min) + 1e-3, np.log(tau_max) - 1e-3
         p = type(p)(np.exp(np.clip(np.log(p.tau_j), lo, hi)), p.lam, np.exp(np.clip(np.log(p.tau_ij), lo, hi)))
+    
     lam = np.clip(p.lam, 1e-4, None)
-    slack = np.clip(1.0 - lam.sum(1, keepdims=True), 1e-3, None)
-    full = np.concatenate([lam, slack], axis=1)
-    full = full / full.sum(1, keepdims=True)
+    # Force the exact sum to 1.0 without the slack variable
+    full = lam / lam.sum(1, keepdims=True)
+    
     return {"log_tau_j": jnp.log(jnp.asarray(p.tau_j)), "log_tau_ij": jnp.log(jnp.asarray(p.tau_ij)),
             "lam_full": jnp.asarray(full), "sigma": jnp.asarray(sigma),
             **({} if phi is None else {"phi": jnp.asarray(np.clip(phi, -0.9, 0.9))})}
-
 
 def run_nuts(model, inits, warmup, samples, seed, target_accept=0.9, max_tree_depth=8, progress=False):
     """Run NUTS sampling for each chain and gather the posterior output.
@@ -1184,7 +1176,7 @@ def plot_producer(path, t, H, obs, start, band, param_band, best, title, labels,
         ax.spines[sp].set_visible(False)
     ax.legend(fontsize=7.5, frameon=False, loc="upper left", bbox_to_anchor=(1.01, 1.0))
     fig.tight_layout()
-    fig.savefig(path, dpi=150)
+    fig.savefig(path, dpi=2400)
     plt.close(fig)
 
 
@@ -1223,7 +1215,7 @@ def plot_parameter_posteriors(path, tau_j, lam, tau_ij, j, pname, injectors):
     
     fig.suptitle(f"Posterior Parameter Distributions: {pname}", fontsize=14, y=0.99)
     fig.tight_layout()
-    fig.savefig(path, dpi=150)
+    fig.savefig(path, dpi=2400)
     plt.close(fig)
 
 
@@ -1293,7 +1285,7 @@ def run_pipeline(a, ml_models=("xgb",)):
     log(f"N={N} history={H} holdout={N - H}; injectors={I} producers={J}")
     log(f"producer start rows: {dict(zip(d.producers, s.tolist()))}")
 
-    # ---- Step 1: deterministic CRM (article-faithful baseline and sampler start points)
+    # ---- Step 1: deterministic CRM (baseline and sampler start points)
     import pickle
     cache = out / f"det_fit_H{H}_s{a.starts}_it{a.max_iter}_seed{a.seed}_tmin{a.tau_min:.6g}.pkl"
     t0 = time.time()
@@ -1321,14 +1313,14 @@ def run_pipeline(a, ml_models=("xgb",)):
     resid = np.maximum(np.array(resid), 1e-3)
     scale = (np.array([np.std(y[rows_hist[j], j]) for j in range(J)]) if lik in ("normal", "ar1") else np.ones(J))
     model, n_obs, n_zero = make_model(hist.time, hist.injection, s, q0, hist.production, lik, a.tau_min,
-                                      1000.0 * H, np.log(10.0), a.tau_prior_sd, a.alpha, scale)
+                                      4.5 * H, np.log(10.0), a.tau_prior_sd, a.alpha, scale)
     phi0 = None
     if lik == "ar1":
         phi0 = np.array([np.corrcoef((y[rows_hist[j], j] - det[rows_hist[j], j])[:-1],
                                      (y[rows_hist[j], j] - det[rows_hist[j], j])[1:])[0, 1] for j in range(J)])
         resid = resid * np.sqrt(1 - np.clip(phi0, -0.9, 0.9) ** 2)
     sols = [sp for _, sp in fit.solutions]
-    inits = [init_values(sols[c % len(sols)], J, resid, a.tau_min, 1000.0 * H, phi0) for c in range(a.chains)]
+    inits = [init_values(sols[c % len(sols)], J, resid, a.tau_min, 4.5 * H, phi0) for c in range(a.chains)]
     log(f"NUTS ({lik} likelihood): {a.chains} chains x ({a.warmup} warmup + {a.samples} draws), {n_obs} data rows")
     t0 = time.time()
     grouped, info = run_nuts(model, inits, a.warmup, a.samples, a.seed)
@@ -1347,7 +1339,7 @@ def run_pipeline(a, ml_models=("xgb",)):
     
     # NEW CODE: Generate and save posterior distributions for CRM parameters
     for j, pname in enumerate(d.producers):
-        f_post = out / "plots" / f"Posterior_Params_{safe_name(pname)}.png"
+        f_post = out / "plots" / f"Posterior_Params_{safe_name(pname)}.svg"
         plot_parameter_posteriors(f_post, tau_j[:, j], lam[:, :, j], tau_ij[:, :, j], j, pname, d.injectors)
 
     names = ([f"tau_j[{n}]" for n in d.producers] + [f"lambda[{i}->{p}]" for i in d.injectors for p in d.producers]
@@ -1391,7 +1383,7 @@ def run_pipeline(a, ml_models=("xgb",)):
 
     plots = []
     for j, pname in enumerate(d.producers):
-        f = out / "plots" / f"CRM_{safe_name(pname)}.png"
+        f = out / "plots" / f"CRM_{safe_name(pname)}.svg"
         plot_producer(f, d.time, H, y[:, j], s[j], {k: v[:, j] for k, v in pp.items()},
                       {k: v[:, j] for k, v in pr.items()}, best[:, j],
                       f"{pname}: Bayesian CRM ({lik} likelihood)", labels)
@@ -1436,7 +1428,7 @@ def run_pipeline(a, ml_models=("xgb",)):
                                "chosen_hyperparameters": {d.producers[j]: hy.chosen[j] for j in range(J)},
                                "holdout_sd_of_mean_across_draws": dict(zip(d.producers, spread.round(4).tolist()))}
             for j, pname in enumerate(d.producers):
-                f = out / "plots" / f"{tag}_{safe_name(pname)}.png"
+                f = out / "plots" / f"{tag}_{safe_name(pname)}.svg"
                 plot_producer(f, d.time, H, y[:, j], s[j], {k: v[:, j] for k, v in ph.items()},
                               {k: v[:, j] for k, v in phr.items()}, hyb[k_hb][:, j],
                               f"{pname}: {tag} on Bayesian CRM posterior ({lik} likelihood)", labels,
