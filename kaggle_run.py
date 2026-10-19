@@ -8,7 +8,7 @@ os.environ["PATH"] += os.pathsep + "/root/.local/bin"
 
 # 2. Clone your GitHub repository to get the script and Excel file
 # REPLACE THIS with your actual public GitHub URL
-repo_url = "https://github.com/your-username/your-repo-name.git"
+repo_url = "https://github.com/idioseph/crm-ml.git"
 print("Downloading files from GitHub...")
 subprocess.run(["git", "clone", repo_url, "project_files"], check=True)
 
